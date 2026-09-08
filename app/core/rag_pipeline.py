@@ -41,10 +41,13 @@ def ask_llm(prompt: str) -> str:
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            "options": {
+                "temperature": 0.1,  # low temperature = more factual, less random
+            },
         },
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    response.raise_for_status()  # raises an error if the request failed
+    response.raise_for_status()
     return response.json()["response"]
 
 
