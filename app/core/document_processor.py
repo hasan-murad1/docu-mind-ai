@@ -31,10 +31,27 @@ def extract_text(file_path: str) -> str:
         raise ValueError(f"Unsupported file type: {extension}")
 
 
-# Quick manual test - only runs when this file is executed directly
+def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
+    """Split text into overlapping chunks of roughly `chunk_size` words."""
+    words = text.split()
+    chunks = []
+
+    start = 0
+    while start < len(words):
+        end = start + chunk_size
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        start += chunk_size - overlap
+
+    return chunks
+
+
 if __name__ == "__main__":
     test_file = "data/sample_test.docx"
     extracted_text = extract_text(test_file)
-    print("--- EXTRACTED TEXT ---")
-    print(extracted_text)
-    print("--- END ---")
+
+    chunks = chunk_text(extracted_text, chunk_size=30, overlap=5)
+    print(f"Total chunks created: {len(chunks)}")
+    for i, chunk in enumerate(chunks):
+        print(f"\n--- Chunk {i+1} ---")
+        print(chunk)
