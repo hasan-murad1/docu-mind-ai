@@ -66,7 +66,7 @@ async def upload_document(file: UploadFile = File(...)):
         if not text.strip():
             raise HTTPException(status_code=400, detail="No readable text found in file.")
 
-        chunks = chunk_text(text, chunk_size=300, overlap=50)
+        chunks = chunk_text(text, chunk_size=100, overlap=20)
         stored_count = add_chunks_to_store(chunks, source_filename=file.filename)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

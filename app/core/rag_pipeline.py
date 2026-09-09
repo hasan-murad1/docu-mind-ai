@@ -19,14 +19,16 @@ def build_prompt(question: str, context_chunks: list[dict]) -> str:
         f"[Source: {c['source']}]\n{c['text']}" for c in context_chunks
     )
 
-    prompt = f"""You are a helpful assistant that answers questions using ONLY the context provided below.
+    prompt = f"""You are a precise assistant that answers questions using ONLY the context below.
+Read the context carefully and find the exact answer, even if it's a single sentence within a longer paragraph.
 If the answer is not in the context, say "I don't have enough information to answer that."
-Do not make up information that isn't in the context.
 
 Context:
 {context_text}
 
 Question: {question}
+
+Instructions: Answer directly and specifically based on the context above. Quote the relevant part if helpful.
 
 Answer:"""
 
