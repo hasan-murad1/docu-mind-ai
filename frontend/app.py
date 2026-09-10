@@ -36,6 +36,7 @@ st.markdown("""
         font-size: 2.6rem;
         font-weight: 800;
         color: #F3F4F6;
+        margin-top: 10px;
         margin-bottom: 0;
         line-height: 1.2;
     }
@@ -68,6 +69,11 @@ st.markdown("""
         margin-top: 1rem;
         font-size: 0.8rem;
     }
+
+    [data-testid="stFileUploaderDropzoneInstructions"] span,
+    [data-testid="stFileUploaderDropzoneInstructions"] small {
+        display: none;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -92,7 +98,12 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**📤 Upload a Document**")
-    uploaded_file = st.file_uploader("Choose a PDF or DOCX file", type=["pdf", "docx"], label_visibility="collapsed")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF or DOCX file",
+        type=["pdf", "docx"],
+        label_visibility="collapsed",
+    )
+    st.caption("📁 Drag and drop file here • Limit 20MB • PDF, DOCX")
 
     if uploaded_file is not None:
         if st.button("Process Document", use_container_width=True):

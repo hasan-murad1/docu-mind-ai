@@ -1,5 +1,5 @@
 # DocuMind AI 📄
-
+![DocuMind AI Demo](assets/demo.gif)
 I built this project to understand how RAG (Retrieval-Augmented Generation) systems actually work under the hood — not just calling an API, but building every piece myself: parsing documents, chunking text, generating embeddings, storing them in a vector database, and connecting everything to a local LLM.
 
 The result is a small app where you can upload a PDF or DOCX file and ask questions about it. Instead of the AI guessing or making things up, it looks up the relevant part of your document first, then answers based on that — with a source citation attached.
