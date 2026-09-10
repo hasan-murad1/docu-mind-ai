@@ -6,3 +6,4 @@ data/*.db
 data/chroma_db/
 .DS_Store
 *.log
+data/uploads/
