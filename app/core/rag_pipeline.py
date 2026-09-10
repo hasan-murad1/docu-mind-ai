@@ -53,7 +53,7 @@ def ask_llm(prompt: str) -> str:
     return response.json()["response"]
 
 
-def answer_question(question: str, top_k: int = 3) -> dict:
+def answer_question(question: str, top_k: int = 7) -> dict:
     """
     Full RAG pipeline:
     1. Retrieve relevant chunks from ChromaDB

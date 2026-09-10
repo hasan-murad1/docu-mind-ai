@@ -99,6 +99,16 @@ I also had to lower the LLM's temperature to reduce hallucination — by default
 
 On the security side, file uploads are restricted to PDF/DOCX, capped at 20MB, and saved under a randomly generated filename rather than the user-supplied one, to avoid path traversal issues.
 
+### Known limitations
+
+While testing with a longer, denser document (a fictional company knowledge base with pricing tables and an FAQ section), I found two patterns where answers weren't reliable:
+
+The first is anything requiring the model to compare numbers. For example, asking "my order is 20,000 — can I pay cash on delivery?" sometimes fails even though the document clearly states the COD limit is 15,000. I dug into this by checking retrieval separately from generation, and confirmed the correct sentence was actually being pulled from the vector store every time — the model just couldn't reliably do the "is 20,000 greater than 15,000" comparison on its own. That's a limitation of using a 1B-parameter model, not a bug in the retrieval logic.
+
+The second is dense FAQ-style sections. When a document has many short Q&A pairs back to back, my word-count-based chunking sometimes lumps several unrelated questions into one chunk, which can dilute the specific answer enough that it doesn't get retrieved even at `top_k=7`. A better approach for FAQ content would be to chunk by individual Q&A pairs instead of a fixed word count — something I'd tackle if I extended this project.
+
+I chose not to fix these by switching to a bigger model, mainly to keep the project fast and lightweight to run locally. Worth knowing about if you're testing this yourself.
+
 ## Note
 
 Built as a learning project to understand RAG systems end-to-end. Not production-hardened, but the core pipeline works correctly and is covered by tests.
