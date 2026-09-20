@@ -112,3 +112,7 @@ I chose not to fix these by switching to a bigger model, mainly to keep the proj
 ## Note
 
 Built as a learning project to understand RAG systems end-to-end. Not production-hardened, but the core pipeline works correctly and is covered by tests.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
