@@ -4,11 +4,9 @@ from vector_store import add_chunks_to_store, search_similar_chunks
 
 # Ollama runs a local server on this address by default
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:1b"
-
+OLLAMA_MODEL = "qwen3:4b"
 # Safety limit: don't wait forever for a response if Ollama hangs
-REQUEST_TIMEOUT_SECONDS = 60
-
+REQUEST_TIMEOUT_SECONDS = 180
 
 def build_prompt(question: str, context_chunks: list[dict]) -> str:
     """
@@ -20,15 +18,16 @@ def build_prompt(question: str, context_chunks: list[dict]) -> str:
     )
 
     prompt = f"""You are a precise assistant that answers questions using ONLY the context below.
-Read the context carefully and find the exact answer, even if it's a single sentence within a longer paragraph.
-If the answer is not in the context, say "I don't have enough information to answer that."
+
+Important rules:
+- If the context clearly discusses the topic being asked about, answer using the information and any straightforward comparisons or calculations needed (for example, comparing a number in the question to a number in the context).
+- If the question asks about something that is NOT mentioned anywhere in the context at all (a different topic, person, or fact), say "I don't have information about that in the uploaded document(s)."
+- Do not write creative content (poems, stories, etc.) — only answer factual questions based on the context.
 
 Context:
 {context_text}
 
 Question: {question}
-
-Instructions: Answer directly and specifically based on the context above. Quote the relevant part if helpful.
 
 Answer:"""
 
@@ -53,25 +52,35 @@ def ask_llm(prompt: str) -> str:
     return response.json()["response"]
 
 
+# Chunks with a distance above this are considered "not actually relevant"
+# and will be filtered out before being sent to the LLM. Tune this if needed.
+RELEVANCE_THRESHOLD = 2.0
+
 def answer_question(question: str, top_k: int = 7) -> dict:
     """
     Full RAG pipeline:
     1. Retrieve relevant chunks from ChromaDB
-    2. Build a grounded prompt
-    3. Ask the LLM to answer using only that context
+    2. Filter out chunks that aren't actually close enough to be relevant
+    3. Build a grounded prompt
+    4. Ask the LLM to answer using only that context
     """
     retrieved_chunks = search_similar_chunks(question, top_k=top_k)
 
-    if not retrieved_chunks:
+    # Keep only chunks that are genuinely close in meaning to the question.
+    # This stops leftover/unrelated chunks from confusing the model on
+    # greetings, small talk, or questions about things not in the document.
+    relevant_chunks = [c for c in retrieved_chunks if c["distance"] <= RELEVANCE_THRESHOLD]
+
+    if not relevant_chunks:
         return {
-            "answer": "No documents found. Please upload a document first.",
+            "answer": "I don't have information about that in the uploaded document(s).",
             "sources": [],
         }
 
-    prompt = build_prompt(question, retrieved_chunks)
+    prompt = build_prompt(question, relevant_chunks)
     answer = ask_llm(prompt)
 
-    sources = list(set(c["source"] for c in retrieved_chunks))
+    sources = list(set(c["source"] for c in relevant_chunks))
 
     return {
         "answer": answer,

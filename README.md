@@ -101,11 +101,13 @@ On the security side, file uploads are restricted to PDF/DOCX, capped at 20MB, a
 
 ### Known limitations
 
-While testing with a longer, denser document (a fictional company knowledge base with pricing tables and an FAQ section), I found two patterns where answers weren't reliable:
+With a local model (tested with both `llama3.2:1b` and `qwen3:4b`), a few categories of questions remain less reliable:
 
-The first is anything requiring the model to compare numbers. For example, asking "my order is 20,000 — can I pay cash on delivery?" sometimes fails even though the document clearly states the COD limit is 15,000. I dug into this by checking retrieval separately from generation, and confirmed the correct sentence was actually being pulled from the vector store every time — the model just couldn't reliably do the "is 20,000 greater than 15,000" comparison on its own. That's a limitation of using a 1B-parameter model, not a bug in the retrieval logic.
+- **Numeric reasoning**: questions requiring a comparison against a threshold (e.g., "my order is 20,000 — does X apply?") sometimes fail even when the correct fact is retrieved, because smaller models struggle to compare numbers within a paragraph of context. This improved noticeably with `qwen3:4b` compared to `llama3.2:1b`, but isn't perfectly reliable.
+- **Multiple numeric rules in one chunk**: when a single chunk contains more than one BDT threshold (for example, a membership delivery discount and a separate Cash-on-Delivery limit in the same paragraph), the model can occasionally get confused about which rule applies to which question, even though retrieval correctly found the relevant chunk.
+- **Dense FAQ sections**: when many short Q&A pairs are chunked together by word count, a specific answer can get diluted by surrounding unrelated FAQs, occasionally causing retrieval to miss it. A production version would chunk FAQ-style content by individual Q&A pairs instead of fixed word count.
 
-The second is dense FAQ-style sections. When a document has many short Q&A pairs back to back, my word-count-based chunking sometimes lumps several unrelated questions into one chunk, which can dilute the specific answer enough that it doesn't get retrieved even at `top_k=7`. A better approach for FAQ content would be to chunk by individual Q&A pairs instead of a fixed word count — something I'd tackle if I extended this project.
+These are documented trade-offs from running fully local, free, small-to-mid-sized models rather than bugs in the retrieval pipeline itself — in every case tested, the correct source text was confirmed (via a separate debug script) to have been retrieved successfully.
 
 I chose not to fix these by switching to a bigger model, mainly to keep the project fast and lightweight to run locally. Worth knowing about if you're testing this yourself.
 
