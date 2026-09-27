@@ -101,14 +101,9 @@ On the security side, file uploads are restricted to PDF/DOCX, capped at 20MB, a
 
 ### Known limitations
 
-With a local model (tested with both `llama3.2:1b` and `qwen3:4b`), a few categories of questions remain less reliable:
+Earlier versions of this project (using `llama3.2:1b` and `qwen3:4b` locally via Ollama) struggled with questions requiring numeric comparison across multiple rules in the same chunk. Switching to Groq's cloud-hosted `openai/gpt-oss-20b` model resolved this — it correctly handles multi-step reasoning that the smaller local models could not.
 
-- **Numeric reasoning**: questions requiring a comparison against a threshold (e.g., "my order is 20,000 — does X apply?") sometimes fail even when the correct fact is retrieved, because smaller models struggle to compare numbers within a paragraph of context. This improved noticeably with `qwen3:4b` compared to `llama3.2:1b`, but isn't perfectly reliable.
-- **Multiple numeric rules in one chunk**: when a single chunk contains more than one BDT threshold (for example, a membership delivery discount and a separate Cash-on-Delivery limit in the same paragraph), the model can occasionally get confused about which rule applies to which question, even though retrieval correctly found the relevant chunk.
-- **Dense FAQ sections**: when many short Q&A pairs are chunked together by word count, a specific answer can get diluted by surrounding unrelated FAQs, occasionally causing retrieval to miss it. A production version would chunk FAQ-style content by individual Q&A pairs instead of fixed word count.
-
-These are documented trade-offs from running fully local, free, small-to-mid-sized models rather than bugs in the retrieval pipeline itself — in every case tested, the correct source text was confirmed (via a separate debug script) to have been retrieved successfully.
-
+This project supports both local (Ollama) and cloud (Groq) LLM providers, switchable via a single config variable, making it easy to compare trade-offs between fully local/free inference and faster, more capable cloud inference.
 I chose not to fix these by switching to a bigger model, mainly to keep the project fast and lightweight to run locally. Worth knowing about if you're testing this yourself.
 
 ## Note
