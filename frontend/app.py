@@ -3,6 +3,13 @@ import streamlit as st
 
 API_BASE_URL = "http://127.0.0.1:8000"
 
+def get_error_detail(response) -> str:
+    """Safely read an error message even if the server didn't return JSON."""
+    try:
+        return response.json().get("detail", "Unknown error")
+    except ValueError:
+        return f"Server error ({response.status_code})"
+
 st.set_page_config(page_title="DocuMind AI", page_icon="📄", layout="wide")
 
 # --- Custom CSS ---
@@ -116,7 +123,7 @@ with st.sidebar:
                         st.success(f"✅ {result['chunks_stored']} chunks stored")
                         st.session_state.uploaded_docs.append(uploaded_file.name)
                     else:
-                        st.error(f"Error: {response.json().get('detail', 'Unknown error')}")
+                        st.error(f"Error: {get_error_detail(response)}")
                 except requests.exceptions.ConnectionError:
                     st.error("Could not connect to the backend server. Is it running?")
 
@@ -193,6 +200,6 @@ if user_question:
                 st.session_state.last_sources = sources
                 st.rerun()
             else:
-                st.error(f"Error: {response.json().get('detail', 'Unknown error')}")
+                st.error(f"Error: {get_error_detail(response)}")
         except requests.exceptions.ConnectionError:
             st.error("Could not connect to the backend server. Is it running?")

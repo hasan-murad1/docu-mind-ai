@@ -13,6 +13,10 @@ Everything runs locally. No API keys, no cloud costs, no data leaving your machi
 - Answers are grounded in your actual document content, with the source file shown
 - Search is semantic, not keyword-based — it understands meaning, not just matching words
 
+## Safety limits
+
+The API has basic usage protection built in: a per-client rate limit (10 requests per minute), a daily cap on LLM calls, a maximum question length, and clear error messages when the AI provider itself rate-limits. Counters are kept in memory, so they reset when the server restarts — a production version would store them in Redis or a database.
+
 ## How it's built
 
 | Part | Tool |
