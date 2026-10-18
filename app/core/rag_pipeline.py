@@ -84,6 +84,13 @@ def ask_groq(prompt: str) -> str:
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
+def call_llm(prompt: str) -> str:
+    """Send a prompt to the provider selected by LLM_PROVIDER ("ollama" or "groq")."""
+    if LLM_PROVIDER == "groq":
+        return ask_groq(prompt)
+    if LLM_PROVIDER == "ollama":
+        return ask_llm(prompt)
+    raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER!r}. Use 'ollama' or 'groq'.")
 
 def answer_question(question: str, top_k: int = 7) -> dict:
     """
@@ -105,10 +112,7 @@ def answer_question(question: str, top_k: int = 7) -> dict:
 
     prompt = build_prompt(question, relevant_chunks)
 
-    if LLM_PROVIDER == "groq":
-        answer = ask_groq(prompt)
-    else:
-        answer = ask_llm(prompt)
+    answer = call_llm(prompt)
 
     sources = list(set(c["source"] for c in relevant_chunks))
 
