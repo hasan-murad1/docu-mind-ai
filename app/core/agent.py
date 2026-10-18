@@ -10,8 +10,7 @@ import time
 from dataclasses import dataclass, asdict
 from typing import Callable, Optional
 
-from usage_limiter import MAX_QUESTION_LENGTH
-
+from usage_limiter import MAX_QUESTION_LENGTH, check_and_increment_daily_cap
 # --- Hard limits (no infinite loops) ---
 MAX_RETRIES = 3
 MAX_LLM_CALLS_PER_QUESTION = 8
@@ -22,7 +21,8 @@ NO_INFO_ANSWER = "I don't have information about that in the uploaded document(s
 
 class LLMBudgetExceeded(Exception):
     """Raised when the agent tries to make more LLM calls than allowed."""
-
+class DailyCapExceeded(Exception):
+    """Raised when the daily LLM call cap is reached."""
 
 class LLMBudget:
     """Counts LLM calls for one question and enforces a hard maximum."""
@@ -108,10 +108,26 @@ def _default_llm(prompt: str) -> str:
     """Call the provider selected in rag_pipeline (Ollama or Groq)."""
     import rag_pipeline  # imported lazily so tests don't load heavy models
 
-    if rag_pipeline.LLM_PROVIDER == "groq":
-        return rag_pipeline.ask_groq(prompt)
-    return rag_pipeline.ask_llm(prompt)
+    return rag_pipeline.call_llm(prompt)
 
+
+def make_counted_llm(
+    budget: LLMBudget,
+    llm_fn: Callable[[str], str],
+    daily_cap_fn: Callable[[], bool],
+) -> Callable[[str], str]:
+    """
+    Wrap an LLM function so every call counts toward both limits.
+    Order: per-question budget first (no side effects), then the daily cap.
+    """
+
+    def counted(prompt: str) -> str:
+        budget.consume()
+        if not daily_cap_fn():
+            raise DailyCapExceeded("Daily usage limit reached. Please try again tomorrow.")
+        return llm_fn(prompt)
+
+    return counted
 
 def run_agent(
     question: str,
@@ -120,11 +136,13 @@ def run_agent(
     build_prompt_fn: Optional[Callable] = None,
     threshold: Optional[float] = None,
     top_k: int = DEFAULT_TOP_K,
+    daily_cap_fn: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """
-    Phase 1 agent: vector search -> relevance filter -> one LLM call.
+    Phase 2 agent: vector search -> relevance filter -> one counted LLM call.
+    Every LLM call counts toward the per-question budget AND the daily cap.
     Returns {"answer", "sources", "trace"}.
-    The function arguments can be replaced in tests (dependency injection).
+    Function arguments can be replaced in tests (dependency injection).
     """
     question = validate_question(question)
 
@@ -136,10 +154,14 @@ def run_agent(
         threshold = (
             threshold if threshold is not None else rag_pipeline.RELEVANCE_THRESHOLD
         )
-    llm_fn = llm_fn or _default_llm
 
     trace = AgentTrace()
     budget = LLMBudget()
+    counted_llm = make_counted_llm(
+        budget,
+        llm_fn or _default_llm,
+        daily_cap_fn or check_and_increment_daily_cap,
+    )
 
     # Step 1: retrieve with the vector search tool
     t0 = time.perf_counter()
@@ -159,12 +181,11 @@ def run_agent(
         trace.record("finish_no_info", time.perf_counter(), llm_calls=budget.used)
         return {"answer": NO_INFO_ANSWER, "sources": [], "trace": trace.to_list()}
 
-    # Step 2: generate the answer (1 LLM call)
+    # Step 2: generate the answer (1 counted LLM call)
     t1 = time.perf_counter()
-    budget.consume()
     prompt = build_prompt_fn(question, relevant)
-    answer = llm_fn(prompt)
-    trace.record("generate", t1, llm_calls=budget.used)
+    answer = counted_llm(prompt)
+    trace.record("generate", t1, tool="llm", llm_calls=budget.used)
 
     sources = sorted(set(c["source"] for c in relevant))
     return {"answer": answer, "sources": sources, "trace": trace.to_list()}
