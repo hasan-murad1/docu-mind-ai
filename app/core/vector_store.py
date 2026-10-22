@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import chromadb
+from chromadb.config import Settings
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -36,8 +37,11 @@ STOPWORDS = {
 _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Persistent ChromaDB client - data survives between runs
-_chroma_client = chromadb.PersistentClient(path="data/chroma_db")
-
+# Telemetry off: avoids noisy warnings and sends no usage data anywhere
+_chroma_client = chromadb.PersistentClient(
+    path="data/chroma_db",
+    settings=Settings(anonymized_telemetry=False),
+)
 
 # ---------- Input validation ----------
 
