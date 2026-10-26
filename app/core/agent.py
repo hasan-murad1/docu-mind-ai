@@ -4,22 +4,25 @@ Contains:
 - TraceStep / AgentTrace: records every agent step (no secrets, no prompts).
 - LLMBudget: hard limit on LLM calls per question.
 - make_counted_llm: every LLM call counts toward the budget AND the daily cap.
-- run_agent: plan (choose a tool) -> retrieve -> relevance filter -> generate.
+- run_agent: plan -> retrieve -> evaluate -> (rewrite + retry, max 3) -> generate.
 """
 
 import time
 from dataclasses import dataclass, asdict
 from typing import Callable, Optional
 
+from evaluator import Evaluation, evaluate_context
 from planner import plan_question
 from usage_limiter import MAX_QUESTION_LENGTH, check_and_increment_daily_cap
 
 # --- Hard limits (no infinite loops) ---
-MAX_RETRIES = 3
-MAX_LLM_CALLS_PER_QUESTION = 8
+MAX_RETRIES = 3                  # query rewrites after the first retrieval
+MAX_LLM_CALLS_PER_QUESTION = 8   # worst case now: 1 plan + 4 evaluate + 1 generate = 6
+MAX_CONTEXT_CHUNKS = 8           # chunks kept across retries (best distance first)
 DEFAULT_TOP_K = 7
 
-# Safe default tool: used when the plan is invalid or the chosen tool finds nothing
+# Safe default tool: used when the plan is invalid, the chosen tool finds
+# nothing, and for every retry with a rewritten query (broadest search)
 FALLBACK_TOOL = "vector_search"
 
 NO_INFO_ANSWER = "I don't have information about that in the uploaded document(s)."
@@ -172,6 +175,10 @@ def run_tool(
     return tool_fn(query, top_k, source)
 
 
+def _best_distance(chunks: list[dict]) -> Optional[float]:
+    return min((c["distance"] for c in chunks), default=None)
+
+
 def _retrieve(
     trace: AgentTrace,
     step: str,
@@ -182,21 +189,50 @@ def _retrieve(
     top_k: int,
     threshold: float,
     llm_calls: int,
+    retry: int = 0,
 ) -> list[dict]:
     """Run one tool, keep only chunks within the threshold, and record a trace step."""
     started = time.perf_counter()
     retrieved = run_tool(tools, tool_name, query, top_k, source)
     relevant = [c for c in retrieved if c["distance"] <= threshold]
-    best = min((c["distance"] for c in retrieved), default=None)
     trace.record(
         step,
         started,
         tool=tool_name,
         chunks_retrieved=len(relevant),
-        best_distance=best,
+        best_distance=_best_distance(retrieved),
+        retry=retry,
         llm_calls=llm_calls,
     )
     return relevant
+
+
+def merge_chunks(
+    existing: list[dict],
+    new: list[dict],
+    limit: int = MAX_CONTEXT_CHUNKS,
+) -> list[dict]:
+    """
+    Combine chunks from several retrievals: remove duplicates (same source + text,
+    keeping the best distance), sort by distance, and keep at most `limit`.
+    """
+    best: dict = {}
+    for chunk in list(existing) + list(new):
+        key = (chunk["source"], chunk["text"])
+        if key not in best or chunk["distance"] < best[key]["distance"]:
+            best[key] = chunk
+    return sorted(best.values(), key=lambda c: c["distance"])[:limit]
+
+
+def _normalize_query(query: str) -> str:
+    """Lowercase and collapse spaces, so 'Refund  Policy' == 'refund policy'."""
+    return " ".join(query.lower().split())
+
+
+def _evaluation_step_name(evaluation: Evaluation) -> str:
+    if evaluation.is_fallback:
+        return "evaluate_fallback"
+    return "evaluate_enough" if evaluation.enough else "evaluate_not_enough"
 
 
 # ---------- Agent ----------
@@ -212,9 +248,9 @@ def run_agent(
     daily_cap_fn: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """
-    Phase 4 agent: plan -> retrieve with the chosen tool -> (fallback) -> generate.
+    Phase 5 agent: plan -> retrieve -> evaluate -> (rewrite + retry) -> generate.
 
-    LLM calls per question: 1 for planning + 1 for the answer.
+    LLM calls: 1 plan + 1 evaluate per attempt (max MAX_RETRIES + 1) + 1 answer.
     Every call counts toward the per-question budget AND the daily cap.
     Returns {"answer", "sources", "trace"}.
     All dependencies can be replaced in tests (dependency injection).
@@ -262,36 +298,80 @@ def run_agent(
         llm_calls=budget.used,
     )
 
-    # Step 3: retrieve with the tool the planner chose
-    relevant = _retrieve(
-        trace, "retrieve", tools, plan.tool, plan.query, plan.source,
-        top_k, threshold, budget.used,
-    )
+    # Step 3: retrieve -> evaluate -> rewrite, with a hard limit of MAX_RETRIES retries
+    context: list[dict] = []
+    evaluation: Optional[Evaluation] = None
+    tool, query, source = plan.tool, plan.query, plan.source
+    tried_queries = {_normalize_query(query)}
 
-    # Step 4 (safety net): a specialised tool found nothing -> one plain vector search
-    if not relevant and plan.tool != FALLBACK_TOOL:
-        relevant = _retrieve(
-            trace, "retrieve_fallback", tools, FALLBACK_TOOL, question, None,
-            top_k, threshold, budget.used,
+    for attempt in range(MAX_RETRIES + 1):
+        found = _retrieve(
+            trace, "retrieve", tools, tool, query, source,
+            top_k, threshold, budget.used, retry=attempt,
         )
 
-    if not relevant:
+        # Free safety net (no LLM call): the planner's specialised tool found nothing
+        if attempt == 0 and not found and tool != FALLBACK_TOOL:
+            found = _retrieve(
+                trace, "retrieve_fallback", tools, FALLBACK_TOOL, question, None,
+                top_k, threshold, budget.used, retry=attempt,
+            )
+
+        context = merge_chunks(context, found)
+        is_last_attempt = attempt == MAX_RETRIES
+
+        # Nothing found and no retries left: stop without spending an LLM call
+        if not context and is_last_attempt:
+            break
+
+        # Evaluate the context (1 counted LLM call); may suggest a rewritten query
+        t_eval = time.perf_counter()
+        evaluation = evaluate_context(question, context, counted_llm)
+        trace.record(
+            _evaluation_step_name(evaluation),
+            t_eval,
+            tool="llm",
+            chunks_retrieved=len(context),
+            best_distance=_best_distance(context),
+            retry=attempt,
+            llm_calls=budget.used,
+        )
+
+        if evaluation.enough and context:
+            break
+
+        next_query = evaluation.rewrite
+        if is_last_attempt or next_query is None or _normalize_query(next_query) in tried_queries:
+            break  # no retries left, no new idea, or the same search again
+
+        # Retry with the rewritten query, using the broadest tool
+        tried_queries.add(_normalize_query(next_query))
+        tool, query, source = FALLBACK_TOOL, next_query, None
+
+    if not context or evaluation is None or not evaluation.enough:
         return finish_no_info("finish_no_info")
 
-    # Step 5: answer the user's ORIGINAL question (1 counted LLM call)
+    # Step 4: answer the user's ORIGINAL question (1 counted LLM call)
     t1 = time.perf_counter()
-    answer = counted_llm(build_prompt_fn(question, relevant))
+    answer = counted_llm(build_prompt_fn(question, context))
     trace.record("generate", t1, tool="llm", llm_calls=budget.used)
 
-    sources_used = sorted(set(c["source"] for c in relevant))
+    sources_used = sorted(set(c["source"] for c in context))
     return {"answer": answer, "sources": sources_used, "trace": trace.to_list()}
 
 
 # Manual test: run from the project root
+#   python app/core/agent.py
+#   python app/core/agent.py "Your own question here"
 if __name__ == "__main__":
     import json
+    import sys
 
-    result = run_agent("What does this project use to store embeddings?")
+    question = (
+        sys.argv[1] if len(sys.argv) > 1
+        else "What does this project use to store embeddings?"
+    )
+    result = run_agent(question)
     print("Answer:", result["answer"])
     print("Sources:", result["sources"])
     print("Trace:", json.dumps(result["trace"], indent=2))
