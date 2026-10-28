@@ -1,4 +1,4 @@
-"""Tests for the agent core: trace, budget, daily cap, planning, evaluate + retry loop."""
+"""Tests for the agent core: trace, budget, daily cap, planning, retry loop, self-check."""
 
 import json
 import time
@@ -15,6 +15,7 @@ from agent import (
     LLMBudgetExceeded,
     NO_INFO_ANSWER,
     default_tools,
+    is_no_info_answer,
     make_counted_llm,
     merge_chunks,
     run_agent,
@@ -35,9 +36,16 @@ PLAN_METADATA = '{"tool": "metadata_search", "query": "leave days", "source": "b
 EVAL_ENOUGH = '{"enough": true}'
 EVAL_NO_REWRITE = '{"enough": false, "rewrite": null}'
 
+CHECK_OK = '{"supported": true}'
+CHECK_NO_SUPPORT = '{"supported": false, "answer": null}'
+
 
 def not_enough(rewrite):
     return json.dumps({"enough": False, "rewrite": rewrite})
+
+
+def revised(answer):
+    return json.dumps({"supported": False, "answer": answer})
 
 
 CHUNK_A = {"text": "a", "source": "a.pdf", "distance": 0.5}
@@ -108,7 +116,7 @@ def run(question="question", llm=None, tools=None, sources=("a.pdf", "b.pdf"), c
         question,
         tools=tools,
         sources_fn=lambda: list(sources),
-        llm_fn=llm or ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer"),
+        llm_fn=llm or ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", CHECK_OK),
         build_prompt_fn=fake_prompt,
         threshold=2.0,
         daily_cap_fn=cap or CapCounter(),
@@ -214,7 +222,7 @@ def test_agent_no_relevant_chunks_never_generates():
     assert result["answer"] == NO_INFO_ANSWER
     assert result["sources"] == []
     assert steps(result) == ["plan", "retrieve", "evaluate_not_enough", "finish_no_info"]
-    assert len(llm.prompts) == 2  # plan + evaluate, no generation
+    assert len(llm.prompts) == 2  # plan + evaluate, no draft
 
 
 def test_agent_happy_path_records_trace_and_sources():
@@ -223,25 +231,24 @@ def test_agent_happy_path_records_trace_and_sources():
     trace = result["trace"]
     assert result["answer"] == "the answer"
     assert result["sources"] == ["a.pdf", "b.pdf"]
-    assert steps(result) == ["plan", "retrieve", "evaluate_enough", "generate"]
+    assert steps(result) == ["plan", "retrieve", "evaluate_enough", "draft", "self_check_ok"]
     assert trace[1]["tool"] == "vector_search"
     assert trace[1]["chunks_retrieved"] == 2
     assert trace[1]["best_distance"] == 0.5
-    assert trace[2]["tool"] == "llm"
-    assert trace[2]["chunks_retrieved"] == 2
-    assert trace[3]["llm_calls"] == 3
+    assert trace[3]["chunks_retrieved"] == 2
+    assert trace[4]["llm_calls"] == 4
 
 
 def test_agent_uses_keyword_tool_chosen_by_planner():
     tools, calls = make_tools({"keyword_search": NEAR})
-    result = run(llm=ScriptedLLM(PLAN_KEYWORD, EVAL_ENOUGH, "the answer"), tools=tools)
+    result = run(llm=ScriptedLLM(PLAN_KEYWORD, EVAL_ENOUGH, "the answer", CHECK_OK), tools=tools)
     assert calls == [{"tool": "keyword_search", "query": "INV-42", "source": None}]
     assert result["trace"][1]["tool"] == "keyword_search"
 
 
 def test_agent_passes_source_to_metadata_tool():
     tools, calls = make_tools({"metadata_search": NEAR})
-    run(llm=ScriptedLLM(PLAN_METADATA, EVAL_ENOUGH, "the answer"), tools=tools)
+    run(llm=ScriptedLLM(PLAN_METADATA, EVAL_ENOUGH, "the answer", CHECK_OK), tools=tools)
     assert calls == [{"tool": "metadata_search", "query": "leave days", "source": "b.pdf"}]
 
 
@@ -249,10 +256,10 @@ def test_agent_invalid_plan_falls_back_to_vector_search():
     tools, calls = make_tools({"vector_search": NEAR})
     result = run(
         question="What is the refund policy?",
-        llm=ScriptedLLM("not json at all", EVAL_ENOUGH, "the answer"),
+        llm=ScriptedLLM("not json at all", EVAL_ENOUGH, "the answer", CHECK_OK),
         tools=tools,
     )
-    assert steps(result) == ["plan_fallback", "retrieve", "evaluate_enough", "generate"]
+    assert steps(result) == ["plan_fallback", "retrieve", "evaluate_enough", "draft", "self_check_ok"]
     assert calls == [{"tool": "vector_search", "query": "What is the refund policy?", "source": None}]
 
 
@@ -260,16 +267,18 @@ def test_agent_uses_vector_fallback_when_chosen_tool_finds_nothing():
     tools, calls = make_tools({"keyword_search": FAR, "vector_search": NEAR})
     result = run(
         question="original question",
-        llm=ScriptedLLM(PLAN_KEYWORD, EVAL_ENOUGH, "the answer"),
+        llm=ScriptedLLM(PLAN_KEYWORD, EVAL_ENOUGH, "the answer", CHECK_OK),
         tools=tools,
     )
-    assert steps(result) == ["plan", "retrieve", "retrieve_fallback", "evaluate_enough", "generate"]
+    assert steps(result) == [
+        "plan", "retrieve", "retrieve_fallback", "evaluate_enough", "draft", "self_check_ok",
+    ]
     assert calls[1] == {"tool": "vector_search", "query": "original question", "source": None}
     assert result["answer"] == "the answer"
 
 
 def test_agent_answers_the_original_question_not_the_search_query():
-    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer")
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, _ = make_tools({"vector_search": NEAR})
     run(question="original question", llm=llm, tools=tools)
     assert llm.prompts[2] == "SECRET_PROMPT_TEXT original question"
@@ -282,6 +291,7 @@ def test_trace_never_contains_prompt_or_extra_fields():
     assert "SECRET_PROMPT_TEXT" not in text
     assert "retrieval planner" not in text
     assert "retrieved document text" not in text
+    assert "strict fact-checker" not in text
     for step in result["trace"]:
         assert set(step.keys()) == ALLOWED_KEYS
 
@@ -290,23 +300,23 @@ def test_run_agent_counts_every_llm_call_toward_daily_cap():
     cap = CapCounter()
     tools, _ = make_tools({"vector_search": NEAR})
     run(tools=tools, cap=cap)
-    assert cap.count == 3  # plan + evaluate + generate
+    assert cap.count == 4  # plan + evaluate + draft + self-check
 
 
 def test_run_agent_stops_before_tools_when_daily_cap_reached():
-    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer")
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, calls = make_tools({"vector_search": NEAR})
     with pytest.raises(DailyCapExceeded):
         run(llm=llm, tools=tools, cap=CapCounter(limit=0))
     assert llm.prompts == [] and calls == []
 
 
-def test_run_agent_daily_cap_reached_at_generate_step():
-    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer")
+def test_run_agent_daily_cap_reached_at_draft_step():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, _ = make_tools({"vector_search": NEAR})
     with pytest.raises(DailyCapExceeded):
         run(llm=llm, tools=tools, cap=CapCounter(limit=2))
-    assert len(llm.prompts) == 2  # plan + evaluate ran, generation was blocked
+    assert len(llm.prompts) == 2  # plan + evaluate ran, the draft was blocked
 
 
 def test_run_tool_rejects_unknown_tool():
@@ -322,11 +332,12 @@ def test_default_tools_match_allowed_tools():
 # ---------- Phase 5: evaluate + rewrite loop ----------
 
 def test_rewrite_then_success():
-    llm = ScriptedLLM(PLAN_VECTOR, not_enough("better query"), EVAL_ENOUGH, "the answer")
+    llm = ScriptedLLM(PLAN_VECTOR, not_enough("better query"), EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, calls = make_tools({"vector_search": {"short query": FAR, "better query": NEAR}})
     result = run(llm=llm, tools=tools)
     assert steps(result) == [
-        "plan", "retrieve", "evaluate_not_enough", "retrieve", "evaluate_enough", "generate",
+        "plan", "retrieve", "evaluate_not_enough", "retrieve", "evaluate_enough",
+        "draft", "self_check_ok",
     ]
     assert result["trace"][3]["retry"] == 1
     assert calls[1] == {"tool": "vector_search", "query": "better query", "source": None}
@@ -334,7 +345,7 @@ def test_rewrite_then_success():
 
 
 def test_chunks_are_kept_across_retries():
-    llm = ScriptedLLM(PLAN_VECTOR, not_enough("better query"), EVAL_ENOUGH, "the answer")
+    llm = ScriptedLLM(PLAN_VECTOR, not_enough("better query"), EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, _ = make_tools({"vector_search": {"short query": [CHUNK_A], "better query": [CHUNK_B]}})
     result = run(llm=llm, tools=tools)
     assert result["sources"] == ["a.pdf", "b.pdf"]
@@ -376,10 +387,10 @@ def test_close_but_irrelevant_chunks_give_no_info_and_no_sources():
 
 
 def test_invalid_evaluator_output_falls_back_to_generating():
-    llm = ScriptedLLM(PLAN_VECTOR, "garbage", "the answer")
+    llm = ScriptedLLM(PLAN_VECTOR, "garbage", "the answer", CHECK_OK)
     tools, _ = make_tools({"vector_search": NEAR})
     result = run(llm=llm, tools=tools)
-    assert steps(result) == ["plan", "retrieve", "evaluate_fallback", "generate"]
+    assert steps(result) == ["plan", "retrieve", "evaluate_fallback", "draft", "self_check_ok"]
     assert result["answer"] == "the answer"
 
 
@@ -393,7 +404,7 @@ def test_empty_final_attempt_spends_no_llm_call():
 
 
 def test_retries_use_vector_search_even_if_planner_chose_keyword():
-    llm = ScriptedLLM(PLAN_KEYWORD, not_enough("better query"), EVAL_ENOUGH, "the answer")
+    llm = ScriptedLLM(PLAN_KEYWORD, not_enough("better query"), EVAL_ENOUGH, "the answer", CHECK_OK)
     tools, calls = make_tools({"keyword_search": NEAR, "vector_search": {"better query": NEAR}})
     run(llm=llm, tools=tools)
     assert calls[0]["tool"] == "keyword_search"
@@ -403,12 +414,12 @@ def test_retries_use_vector_search_even_if_planner_chose_keyword():
 def test_worst_case_stays_within_llm_budget():
     llm = ScriptedLLM(
         PLAN_VECTOR, not_enough("q1"), not_enough("q2"), not_enough("q3"),
-        EVAL_ENOUGH, "the answer",
+        EVAL_ENOUGH, "the answer", CHECK_OK,
     )
     tools, _ = make_tools({"vector_search": NEAR})
     result = run(llm=llm, tools=tools)
     assert result["answer"] == "the answer"
-    assert result["trace"][-1]["llm_calls"] == 6
+    assert result["trace"][-1]["llm_calls"] == 7
     assert result["trace"][-1]["llm_calls"] <= MAX_LLM_CALLS_PER_QUESTION
 
 
@@ -421,3 +432,74 @@ def test_merge_chunks_dedupes_sorts_and_caps():
     capped = merge_chunks([], many)
     assert len(capped) == MAX_CONTEXT_CHUNKS
     assert [c["distance"] for c in capped] == sorted(c["distance"] for c in capped)
+
+
+# ---------- Phase 6: draft + self-check ----------
+
+def test_no_info_draft_hides_sources_and_skips_self_check():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, NO_INFO_ANSWER)
+    tools, _ = make_tools({"vector_search": NEAR})
+    result = run(llm=llm, tools=tools)
+    assert result["answer"] == NO_INFO_ANSWER
+    assert result["sources"] == []
+    assert steps(result) == ["plan", "retrieve", "evaluate_enough", "draft", "finish_no_info"]
+    assert len(llm.prompts) == 3  # no self-check call
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (NO_INFO_ANSWER, True),
+        ("  I DON\u2019T have information about the CEO.", True),  # curly apostrophe
+        ('"I do not have information."', True),
+        ("", True),
+        ("The refund window is 30 days.", False),
+        ("Refunds take 30 days. I don't have information about shipping.", False),
+    ],
+)
+def test_is_no_info_answer(text, expected):
+    assert is_no_info_answer(text) is expected
+
+
+def test_self_check_revises_an_unsupported_draft():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "Refunds take 60 days.", revised("Refunds take 30 days."))
+    tools, _ = make_tools({"vector_search": NEAR})
+    result = run(llm=llm, tools=tools)
+    assert result["answer"] == "Refunds take 30 days."
+    assert result["sources"] == ["a.pdf", "b.pdf"]
+    assert steps(result)[-1] == "self_check_revised"
+
+
+def test_self_check_without_support_gives_no_info_and_no_sources():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "Made-up answer.", CHECK_NO_SUPPORT)
+    tools, _ = make_tools({"vector_search": NEAR})
+    result = run(llm=llm, tools=tools)
+    assert result["answer"] == NO_INFO_ANSWER
+    assert result["sources"] == []
+    assert steps(result)[-2:] == ["self_check_unsupported", "finish_no_info"]
+
+
+def test_revised_no_info_answer_also_hides_sources():
+    llm = ScriptedLLM(
+        PLAN_VECTOR, EVAL_ENOUGH, "Made-up answer.",
+        revised("I don't have information about that."),
+    )
+    tools, _ = make_tools({"vector_search": NEAR})
+    result = run(llm=llm, tools=tools)
+    assert result["answer"] == NO_INFO_ANSWER
+    assert result["sources"] == []
+
+
+def test_invalid_self_check_output_keeps_the_draft():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", "looks good to me")
+    tools, _ = make_tools({"vector_search": NEAR})
+    result = run(llm=llm, tools=tools)
+    assert result["answer"] == "the answer"
+    assert steps(result)[-1] == "self_check_fallback"
+
+
+def test_self_check_receives_the_draft():
+    llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, "the answer", CHECK_OK)
+    tools, _ = make_tools({"vector_search": NEAR})
+    run(llm=llm, tools=tools)
+    assert "<draft>\nthe answer\n</draft>" in llm.prompts[3]
