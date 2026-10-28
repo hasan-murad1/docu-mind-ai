@@ -4,7 +4,8 @@ Contains:
 - TraceStep / AgentTrace: records every agent step (no secrets, no prompts).
 - LLMBudget: hard limit on LLM calls per question.
 - make_counted_llm: every LLM call counts toward the budget AND the daily cap.
-- run_agent: plan -> retrieve -> evaluate -> (rewrite + retry, max 3) -> generate.
+- run_agent: plan -> retrieve -> evaluate -> (rewrite + retry, max 3)
+  -> draft -> self-check -> answer + sources.
 """
 
 import time
@@ -13,11 +14,12 @@ from typing import Callable, Optional
 
 from evaluator import Evaluation, evaluate_context
 from planner import plan_question
+from self_check import SelfCheck, check_answer
 from usage_limiter import MAX_QUESTION_LENGTH, check_and_increment_daily_cap
 
 # --- Hard limits (no infinite loops) ---
 MAX_RETRIES = 3                  # query rewrites after the first retrieval
-MAX_LLM_CALLS_PER_QUESTION = 8   # worst case now: 1 plan + 4 evaluate + 1 generate = 6
+MAX_LLM_CALLS_PER_QUESTION = 8   # worst case: 1 plan + 4 evaluate + 1 draft + 1 self-check = 7
 MAX_CONTEXT_CHUNKS = 8           # chunks kept across retries (best distance first)
 DEFAULT_TOP_K = 7
 
@@ -26,6 +28,7 @@ DEFAULT_TOP_K = 7
 FALLBACK_TOOL = "vector_search"
 
 NO_INFO_ANSWER = "I don't have information about that in the uploaded document(s)."
+_NO_INFO_PREFIXES = ("i don't have information", "i do not have information")
 
 
 class LLMBudgetExceeded(Exception):
@@ -114,6 +117,15 @@ def validate_question(question) -> str:
     if len(question) > MAX_QUESTION_LENGTH:
         raise ValueError(f"Question too long. Max {MAX_QUESTION_LENGTH} characters.")
     return question
+
+
+def is_no_info_answer(text) -> bool:
+    """True if an answer is empty or starts with the standard 'no information' sentence."""
+    if not isinstance(text, str):
+        return True
+    normalized = " ".join(text.replace("\u2019", "'").lower().split())
+    normalized = normalized.lstrip("\"'*` ")
+    return not normalized or normalized.startswith(_NO_INFO_PREFIXES)
 
 
 def _default_llm(prompt: str) -> str:
@@ -235,6 +247,14 @@ def _evaluation_step_name(evaluation: Evaluation) -> str:
     return "evaluate_enough" if evaluation.enough else "evaluate_not_enough"
 
 
+def _self_check_step_name(check: SelfCheck) -> str:
+    if check.is_fallback:
+        return "self_check_fallback"
+    if check.supported:
+        return "self_check_ok"
+    return "self_check_revised" if check.answer is not None else "self_check_unsupported"
+
+
 # ---------- Agent ----------
 
 def run_agent(
@@ -248,10 +268,12 @@ def run_agent(
     daily_cap_fn: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """
-    Phase 5 agent: plan -> retrieve -> evaluate -> (rewrite + retry) -> generate.
+    Phase 6 agent: plan -> retrieve -> evaluate -> (rewrite + retry)
+    -> draft -> self-check -> answer + sources.
 
-    LLM calls: 1 plan + 1 evaluate per attempt (max MAX_RETRIES + 1) + 1 answer.
-    Every call counts toward the per-question budget AND the daily cap.
+    LLM calls: 1 plan + 1 evaluate per attempt (max MAX_RETRIES + 1)
+    + 1 draft + 1 self-check. Every call counts toward the per-question
+    budget AND the daily cap. "No info" answers never show sources.
     Returns {"answer", "sources", "trace"}.
     All dependencies can be replaced in tests (dependency injection).
     """
@@ -351,10 +373,32 @@ def run_agent(
     if not context or evaluation is None or not evaluation.enough:
         return finish_no_info("finish_no_info")
 
-    # Step 4: answer the user's ORIGINAL question (1 counted LLM call)
+    # Step 4: draft an answer to the user's ORIGINAL question (1 counted LLM call)
     t1 = time.perf_counter()
-    answer = counted_llm(build_prompt_fn(question, context))
-    trace.record("generate", t1, tool="llm", llm_calls=budget.used)
+    draft = counted_llm(build_prompt_fn(question, context))
+    trace.record("draft", t1, tool="llm", chunks_retrieved=len(context), llm_calls=budget.used)
+
+    # The model itself said "no info": skip the self-check and hide sources
+    if is_no_info_answer(draft):
+        return finish_no_info("finish_no_info")
+
+    # Step 5: self-check the draft against the same context (1 counted LLM call)
+    t2 = time.perf_counter()
+    check = check_answer(question, draft, context, counted_llm)
+    trace.record(
+        _self_check_step_name(check),
+        t2,
+        tool="llm",
+        chunks_retrieved=len(context),
+        llm_calls=budget.used,
+    )
+
+    if check.supported:  # also covers the fallback (invalid self-check output)
+        answer = draft
+    elif check.answer is not None and not is_no_info_answer(check.answer):
+        answer = check.answer
+    else:
+        return finish_no_info("finish_no_info")
 
     sources_used = sorted(set(c["source"] for c in context))
     return {"answer": answer, "sources": sources_used, "trace": trace.to_list()}
