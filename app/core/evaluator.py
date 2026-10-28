@@ -21,9 +21,8 @@ from usage_limiter import MAX_QUESTION_LENGTH
 EVAL_KEYS = {"enough", "rewrite"}
 MAX_CHUNK_CHARS_IN_PROMPT = 2000  # one huge "word" in a PDF can't flood the prompt
 
-# Matches <context>, </context>, <question>, </question> (any case, extra spaces)
-_MARKER_TAGS = re.compile(r"<\s*/?\s*(?:context|question)\s*>", re.IGNORECASE)
-
+# Matches our own tags <context>, <question>, <draft> and their closing forms
+_MARKER_TAGS = re.compile(r"<\s*/?\s*(?:context|question|draft)\s*>", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class Evaluation:
