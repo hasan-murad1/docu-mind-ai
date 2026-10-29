@@ -1,9 +1,10 @@
-"""Pytest setup: make app/core importable for every test file."""
+"""Pytest setup: make app/core, app/ (main.py) and frontend/ importable."""
 
 import sys
 from pathlib import Path
 
-CORE_DIR = Path(__file__).resolve().parent.parent / "app" / "core"
+ROOT = Path(__file__).resolve().parent.parent
 
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
+for folder in (ROOT / "frontend", ROOT / "app", ROOT / "app" / "core"):
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
