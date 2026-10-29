@@ -22,7 +22,7 @@ OLLAMA_MODEL = "qwen3:4b"
 # --- Groq settings (cloud) ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "openai/gpt-oss-20b"
+GROQ_MODEL = "qwen/qwen3.8-27b"
 # Safety limit: don't wait forever for a response if a provider hangs
 REQUEST_TIMEOUT_SECONDS = 180
 
