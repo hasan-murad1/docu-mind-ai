@@ -1,4 +1,7 @@
+import logging
 import os
+import time
+
 import requests
 from dotenv import load_dotenv
 from document_processor import extract_text, chunk_text
@@ -6,6 +9,8 @@ from vector_store import add_chunks_to_store, search_similar_chunks
 from evaluator import format_context, neutralize_markers
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # --- Provider selection ---
 LLM_PROVIDER = "groq"  # "groq" (cloud) or "ollama" (local)
@@ -20,6 +25,12 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "openai/gpt-oss-20b"
 # Safety limit: don't wait forever for a response if a provider hangs
 REQUEST_TIMEOUT_SECONDS = 180
+
+# --- Provider rate limit (HTTP 429) handling: bounded retries, capped waits ---
+MAX_PROVIDER_RETRIES = 2
+MAX_RETRY_WAIT_SECONDS = 20.0
+DEFAULT_RETRY_WAIT_SECONDS = 2.0
+_sleep = time.sleep  # replaced in tests so they run instantly
 
 # Chunks with a distance above this are considered "not actually relevant"
 # and will be filtered out before being sent to the LLM.
@@ -55,37 +66,66 @@ Important rules:
 Answer:"""
 
 
+def retry_wait_seconds(response) -> float:
+    """Read the provider's Retry-After header, with a safe default and a hard cap."""
+    try:
+        wait = float(response.headers.get("retry-after", DEFAULT_RETRY_WAIT_SECONDS))
+    except (TypeError, ValueError):
+        wait = DEFAULT_RETRY_WAIT_SECONDS
+    return min(max(wait, 0.5), MAX_RETRY_WAIT_SECONDS)
+
+
+def post_with_retry(url: str, payload: dict, headers: dict | None = None) -> requests.Response:
+    """
+    POST to an LLM provider. On HTTP 429 (rate limit) wait and retry,
+    at most MAX_PROVIDER_RETRIES times. Other errors are raised immediately.
+    """
+    response = None
+    for attempt in range(MAX_PROVIDER_RETRIES + 1):
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        if response.status_code != 429 or attempt == MAX_PROVIDER_RETRIES:
+            break
+        wait = retry_wait_seconds(response)
+        logger.warning(
+            "LLM provider rate limit (429). Waiting %.1fs, retry %d of %d.",
+            wait, attempt + 1, MAX_PROVIDER_RETRIES,
+        )
+        _sleep(wait)
+
+    if response.status_code == 429:
+        # The error body says which limit was hit (e.g. tokens per minute); it never contains the API key
+        logger.warning("LLM provider is still rate limiting: %s", response.text[:300])
+    response.raise_for_status()
+    return response
+
+
 def ask_llm(prompt: str) -> str:
     """Send a prompt to the local Ollama server and return the generated answer."""
-    response = requests.post(
+    response = post_with_retry(
         OLLAMA_URL,
-        json={
+        {
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": 0.1,
-            },
+            "options": {"temperature": 0.1},
         },
-        timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
     return response.json()["response"]
 
 
 def ask_groq(prompt: str) -> str:
     """Send a prompt to the Groq API and return the generated answer."""
-    response = requests.post(
+    response = post_with_retry(
         GROQ_URL,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
+        {
             "model": GROQ_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
         },
-        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
     )
-    response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
 
@@ -100,7 +140,7 @@ def call_llm(prompt: str) -> str:
 
 def answer_question(question: str, top_k: int = 7) -> dict:
     """
-    Classic (non-agent) RAG pipeline, kept until the API switches to the agent:
+    Classic (non-agent) RAG pipeline, kept for reference and manual testing:
     1. Retrieve relevant chunks from ChromaDB
     2. Filter out chunks that aren't actually close enough to be relevant
     3. Build a grounded prompt
