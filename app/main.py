@@ -1,6 +1,13 @@
+"""DocuMind AI - FastAPI backend.
+
+/upload : validate, extract, chunk, embed and store a document
+/ask    : answer a question with the agentic RAG pipeline (returns a trace)
+"""
+
 import sys
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -9,14 +16,10 @@ from pydantic import BaseModel
 # Allow importing modules from app/core
 sys.path.append(str(Path(__file__).parent / "core"))
 
+from agent import DailyCapExceeded, LLMBudgetExceeded, run_agent, validate_question
 from document_processor import extract_text, chunk_text
 from vector_store import add_chunks_to_store
-from rag_pipeline import answer_question
-from usage_limiter import (
-    check_rate_limit,
-    check_and_increment_daily_cap,
-    MAX_QUESTION_LENGTH,
-)
+from usage_limiter import check_rate_limit
 
 app = FastAPI(title="DocuMind AI")
 
@@ -29,6 +32,24 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 class QuestionRequest(BaseModel):
     question: str
+
+
+class TraceStepOut(BaseModel):
+    """Public shape of one trace step. Any extra field is dropped from the response."""
+
+    step: str
+    tool: str
+    chunks_retrieved: int
+    best_distance: Optional[float]
+    retry: int
+    time_ms: float
+    llm_calls: int
+
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    trace: list[TraceStepOut]
 
 
 def get_client_id(http_request: Request) -> str:
@@ -93,33 +114,35 @@ async def upload_document(http_request: Request, file: UploadFile = File(...)):
     }
 
 
-@app.post("/ask")
+@app.post("/ask", response_model=AskResponse)
 def ask_question(request: QuestionRequest, http_request: Request):
-    question = request.question.strip()
+    # 1. Validate the question first (cheap, no limits used)
+    try:
+        question = validate_question(request.question)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    if len(question) > MAX_QUESTION_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Question too long. Max {MAX_QUESTION_LENGTH} characters.",
-        )
-
+    # 2. Per-client rate limit
     if not check_rate_limit(get_client_id(http_request)):
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please wait a minute and try again.",
         )
 
-    if not check_and_increment_daily_cap():
+    # 3. Run the agent. The daily cap is charged inside the agent for EVERY
+    #    LLM call, so there is no upfront daily-cap check here (no double counting).
+    try:
+        return run_agent(question)
+    except DailyCapExceeded:
         raise HTTPException(
             status_code=429,
             detail="Daily usage limit reached. Please try again tomorrow.",
         )
-
-    try:
-        return answer_question(question)
+    except LLMBudgetExceeded:
+        raise HTTPException(
+            status_code=429,
+            detail="This question needed too many AI steps. Please try a simpler question.",
+        )
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 429:
             raise HTTPException(
