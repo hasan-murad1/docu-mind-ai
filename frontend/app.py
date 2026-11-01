@@ -8,6 +8,7 @@ import streamlit as st
 
 from ui_helpers import (
     css_variables,
+    doc_item_html,
     escape_markdown,
     find_chat,
     is_no_info,
@@ -16,14 +17,22 @@ from ui_helpers import (
     timeline_html,
     trace_summary,
     upsert_chat,
+    user_bubble_html,
 )
 
 API_BASE_URL = "http://127.0.0.1:8000"
 UPLOAD_TIMEOUT_SECONDS = 120
 ASK_TIMEOUT_SECONDS = 300  # the agent may make several LLM calls per question
-ASSISTANT_AVATAR = ":material/auto_awesome:"
+
+# Inline SVG mask for the upload icon (black = visible part of the mask)
+_UPLOAD_MASK = (
+    "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' "
+    "fill='none' stroke='black' stroke-width='2'><path d='M12 16V4M7 9l5-5 5 5'/>"
+    "<path d='M4 16v4h16v-4'/></svg>\")"
+)
 
 # Static styles. Colors come from --dm-* variables, so one stylesheet serves both themes.
+# Widgets are targeted by their key (Streamlit adds a "st-key-<key>" class).
 BASE_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -33,72 +42,92 @@ BASE_CSS = """
 .stApp textarea, .stApp h1, .stApp summary { font-family: 'Inter Tight', system-ui, sans-serif; }
 .stApp p, .stApp li, .stApp label, .stApp h1, .stApp summary, .stApp strong { color: var(--dm-text); }
 header[data-testid="stHeader"] { background: transparent; }
-.block-container { max-width: 900px; padding-top: 1.5rem; }
-hr { border-color: var(--dm-border); }
+.block-container { max-width: 900px; padding-top: 1.5rem; padding-bottom: 7rem; }
 
-/* Sidebar */
-section[data-testid="stSidebar"] { background: var(--dm-side); border-right: 1px solid var(--dm-border); }
-.dm-logo { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+/* ---------- Sidebar ---------- */
+section[data-testid="stSidebar"] { background: var(--dm-side); border-right: 1px solid var(--dm-border);
+    min-width: 300px; }
+[data-testid="stSidebarHeader"] { height: 0; min-height: 0; padding: 0; }
+[data-testid="stSidebarUserContent"] { padding-top: 22px; }
+[data-testid="stSidebarCollapseButton"] { display: flex !important; visibility: visible !important;
+    opacity: 1 !important; position: absolute; top: 22px; right: 16px; z-index: 100; }
+[data-testid="stSidebarCollapsedControl"] { display: flex !important; visibility: visible !important;
+    opacity: 1 !important; }
+[data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button {
+    width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--dm-border2) !important;
+    background: var(--dm-surface) !important; }
+[data-testid="stSidebarCollapseButton"] *, [data-testid="stSidebarCollapsedControl"] * {
+    color: var(--dm-text) !important; }
+
+.dm-logo { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .dm-logo-mark { width: 32px; height: 32px; border-radius: 8px; background: var(--dm-accent);
     display: flex; align-items: center; justify-content: center; }
 .dm-logo-name { font-weight: 700; font-size: 16px; line-height: 1.2; color: var(--dm-text); }
-.stApp .dm-logo-sub, .stApp .dm-label, .stApp .dm-hint, .stApp .dm-muted { color: var(--dm-muted); }
+.stApp .dm-logo-sub, .stApp .dm-label, .stApp .dm-hint, .stApp .dm-muted, .dm-doc-sub { color: var(--dm-muted); }
 .dm-logo-sub { font-size: 12px; }
-.stApp .dm-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 12px 0 4px; }
+.stApp .dm-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 14px 0 6px; }
 .stApp .dm-hint { font-size: 12px; text-align: center; margin: -6px 0 4px; }
 .dm-doc { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
-    background: var(--dm-surface); border: 1px solid var(--dm-border); font-size: 13px;
-    margin-bottom: 6px; color: var(--dm-text); }
-.dm-doc span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    background: var(--dm-surface); border: 1px solid var(--dm-border); margin-bottom: 6px;
+    color: var(--dm-accent); }
+.dm-doc-text { min-width: 0; }
+.dm-doc-name { font-size: 13px; color: var(--dm-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-doc-sub { font-size: 11px; }
 
-section[data-testid="stSidebar"] .stButton button { width: 100%; justify-content: flex-start;
-    min-height: 40px; border-radius: 10px; font-size: 14px; }
-section[data-testid="stSidebar"] .stButton button[kind="secondary"] { background: transparent;
-    border: 1px solid transparent; color: var(--dm-muted); }
-section[data-testid="stSidebar"] .stButton button[kind="secondary"]:hover { background: var(--dm-surface);
-    color: var(--dm-text); }
-section[data-testid="stSidebar"] .stButton button[kind="primary"] { background: var(--dm-bubble);
-    border: 1px solid var(--dm-border2); color: var(--dm-text); }
-section[data-testid="stSidebar"] .stButton button p { color: inherit; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; }
+/* Buttons */
+.stApp .stButton button { border-radius: 10px; min-height: 40px; box-shadow: none; }
+.stApp .stButton button p { color: inherit; font-size: 14px; }
+.st-key-new_chat button { width: 100%; justify-content: flex-start; background: var(--dm-surface) !important;
+    border: 1px solid var(--dm-border2) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button { width: 100%; justify-content: flex-start; background: transparent !important;
+    border: 1px solid transparent !important; color: var(--dm-muted) !important; }
+[class*="st-key-chat_"] button:hover { background: var(--dm-surface) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button[kind="primary"] { background: var(--dm-bubble) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button div, [class*="st-key-chat_"] button p { min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.st-key-theme_sidebar button { width: 100%; justify-content: flex-start; min-height: 44px;
+    background: transparent !important; border: 1px solid var(--dm-border) !important; color: var(--dm-text) !important; }
+.st-key-theme_header { display: flex; justify-content: flex-end; }
+.st-key-theme_header button { width: 44px; height: 44px; padding: 0; background: transparent !important;
+    border: 1px solid var(--dm-border2) !important; color: var(--dm-text) !important; }
+.st-key-show_agent_details { border: 1px solid var(--dm-border); border-radius: 10px; padding: 10px 12px; }
 
-/* Compact uploader: one pill button, no big drop box */
-section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] { padding: 0; border: 0;
-    background: transparent; min-height: 0; }
-section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"],
-section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"],
-section[data-testid="stSidebar"] [data-testid="stFileUploaderPagination"] { display: none; }
-section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button { width: 100%; height: 40px;
-    border-radius: 999px; border: 1px solid var(--dm-border2); background: var(--dm-surface); font-size: 0; }
-section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button::after {
-    content: "Upload PDF or DOCX"; font-size: 14px; font-weight: 500; color: var(--dm-text); }
+/* Compact uploader: one pill button with an icon */
+.st-key-uploader [data-testid="stFileUploaderDropzone"] { padding: 0 !important; border: 0 !important;
+    background: transparent !important; min-height: 0; }
+.st-key-uploader [data-testid="stFileUploaderDropzoneInstructions"],
+.st-key-uploader [data-testid="stFileUploaderFile"],
+.st-key-uploader [data-testid="stFileUploaderPagination"] { display: none !important; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button { width: 100%; height: 42px; border-radius: 999px;
+    border: 1px solid var(--dm-border2) !important; background: var(--dm-surface) !important; font-size: 0;
+    display: flex; align-items: center; justify-content: center; gap: 8px; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button::before { content: ""; width: 15px; height: 15px;
+    background-color: var(--dm-text); -webkit-mask: UPLOAD_MASK center / contain no-repeat;
+    mask: UPLOAD_MASK center / contain no-repeat; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button::after { content: "Upload PDF or DOCX";
+    font-size: 14px; font-weight: 500; color: var(--dm-text); }
 
-/* Header buttons in the main area */
-[data-testid="stMain"] .stButton button, section.main .stButton button { background: transparent;
-    border: 1px solid var(--dm-border2); color: var(--dm-text); border-radius: 10px; }
+/* ---------- Main area ---------- */
 .stApp h1.dm-title { font-size: 20px; font-weight: 600; margin: 0; padding: 0; }
+.dm-divider { height: 1px; background: var(--dm-border); margin: 8px 0 24px; }
 .dm-empty { border: 1px dashed var(--dm-border2); border-radius: 12px; padding: 18px;
-    color: var(--dm-muted); font-size: 14px; margin-top: 16px; }
-
-/* Chat: user messages are right-aligned bubbles without an avatar */
-[data-testid="stChatMessage"] { background: transparent; padding: 0; gap: 14px; margin-bottom: 12px; }
-.stElementContainer:has(.dm-user), .element-container:has(.dm-user) { display: none; }
-[data-testid="stChatMessage"]:has(.dm-user) { flex-direction: row-reverse; }
-[data-testid="stChatMessage"]:has(.dm-user) [data-testid^="stChatMessageAvatar"] { display: none; }
-[data-testid="stChatMessage"]:has(.dm-user) [data-testid="stChatMessageContent"] { flex: 0 1 auto;
-    max-width: 70%; background: var(--dm-bubble); border-radius: 16px 16px 4px 16px; padding: 12px 16px; }
-[data-testid="stChatMessage"]:has(.dm-user) p { margin: 0; }
-[data-testid="stChatMessage"] [data-testid^="stChatMessageAvatar"] { background: transparent;
-    border: 1px solid var(--dm-border2); border-radius: 8px; color: var(--dm-accent); }
-.stApp p.dm-noinfo { color: var(--dm-muted); }
+    color: var(--dm-muted); font-size: 14px; }
+.dm-user-row { display: flex; justify-content: flex-end; margin: 4px 0 18px; }
+.dm-user-bubble { max-width: 70%; background: var(--dm-bubble); color: var(--dm-text);
+    border-radius: 16px 16px 4px 16px; padding: 12px 16px; font-size: 15px; line-height: 1.5;
+    overflow-wrap: anywhere; }
+.dm-avatar { width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--dm-border2);
+    display: flex; align-items: center; justify-content: center; color: var(--dm-accent); margin-top: 2px; }
+.stApp p.dm-noinfo { color: var(--dm-muted); font-size: 15px; margin: 4px 0 18px; }
 
 /* Sources and agent timeline */
 .dm-sources { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 8px; }
 .dm-chip { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--dm-border2);
     color: var(--dm-muted); }
-[data-testid="stExpander"] details { background: var(--dm-side); border: 1px solid var(--dm-border);
+[data-testid="stExpander"] details { background: var(--dm-side) !important; border: 1px solid var(--dm-border) !important;
     border-radius: 12px; }
 [data-testid="stExpander"] summary p { font-size: 13px; font-weight: 600; }
+[data-testid="stExpander"] summary svg { color: var(--dm-text); }
 .dm-steps { list-style: none; margin: 0; padding: 4px 0; display: flex; flex-direction: column; gap: 10px; }
 .dm-steps li { display: grid; grid-template-columns: 14px 120px 1fr auto; gap: 10px; align-items: center;
     margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--dm-text); }
@@ -107,13 +136,18 @@ section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button::
 .dm-dot-warn { background: var(--dm-warn); }
 
 /* Chat input */
-[data-testid="stBottom"] > div, [data-testid="stBottomBlockContainer"] { background: var(--dm-bg); }
-[data-testid="stChatInput"] { background: var(--dm-input); border: 1px solid var(--dm-border2); border-radius: 14px; }
-[data-testid="stChatInput"] textarea { color: var(--dm-text); background: transparent; }
-[data-testid="stChatInputSubmitButton"] { background: var(--dm-accent); border-radius: 10px; }
-[data-testid="stChatInputSubmitButton"] svg { color: #0B0B0C; fill: #0B0B0C; }
+[data-testid="stBottom"], [data-testid="stBottom"] > div,
+[data-testid="stBottomBlockContainer"] { background: var(--dm-bg) !important; }
+[data-testid="stBottomBlockContainer"] { max-width: 900px; margin: 0 auto; padding-bottom: 24px; }
+[data-testid="stChatInput"], [data-testid="stChatInput"] > div { background: var(--dm-input) !important;
+    border-color: var(--dm-border2) !important; border-radius: 14px !important; }
+[data-testid="stChatInput"] textarea { color: var(--dm-text) !important; background: transparent !important;
+    caret-color: var(--dm-text); }
+[data-testid="stChatInput"] textarea::placeholder { color: var(--dm-muted) !important; opacity: 1; }
+[data-testid="stChatInputSubmitButton"] { background: var(--dm-accent) !important; border-radius: 10px !important; }
+[data-testid="stChatInputSubmitButton"] svg { color: #0B0B0C !important; fill: #0B0B0C !important; }
 </style>
-"""
+""".replace("UPLOAD_MASK", _UPLOAD_MASK)
 
 LOGO_HTML = """
 <div class="dm-logo">
@@ -125,6 +159,11 @@ LOGO_HTML = """
   <div><div class="dm-logo-name">DocuMind AI</div><div class="dm-logo-sub">Agentic RAG</div></div>
 </div>
 """
+
+SPARKLE_SVG = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/></svg>'
+)
 
 
 # ---------- Backend calls ----------
@@ -153,7 +192,7 @@ def ask_backend(question: str):
 
 
 def upload_backend(uploaded_file):
-    """Send a file to the API. Returns (True, message) or (False, error message)."""
+    """Send a file to the API. Returns (True, chunk count) or (False, error message)."""
     try:
         files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
         response = requests.post(
@@ -165,7 +204,7 @@ def upload_backend(uploaded_file):
         return False, "Processing took too long. Please try again."
     if response.status_code != 200:
         return False, f"Error: {get_error_detail(response)}"
-    return True, f"{response.json().get('chunks_stored', 0)} chunks stored"
+    return True, int(response.json().get("chunks_stored", 0))
 
 
 # ---------- Session state ----------
@@ -180,7 +219,7 @@ def init_state() -> None:
         "chats": [],               # saved chats, newest first (this browser session only)
         "current_chat_id": new_chat_id(),
         "chat_history": [],        # messages of the open chat
-        "uploaded_docs": [],
+        "uploaded_docs": [],       # [{"name": ..., "chunks": ...}]
         "processed_uploads": [],   # files already sent, so reruns don't upload twice
     }
     for key, value in defaults.items():
@@ -219,48 +258,37 @@ def handle_upload(uploaded_file) -> None:
         return
     st.session_state.processed_uploads.append(upload_key)
     with st.spinner("Processing document..."):
-        ok, message = upload_backend(uploaded_file)
-    if ok:
-        if uploaded_file.name not in st.session_state.uploaded_docs:
-            st.session_state.uploaded_docs.append(uploaded_file.name)
-        st.toast(f"{uploaded_file.name}: {message}")
-    else:
-        st.error(message)
+        ok, result = upload_backend(uploaded_file)
+    if not ok:
+        st.error(result)
+        return
+    docs = [d for d in st.session_state.uploaded_docs
+            if isinstance(d, dict) and d.get("name") != uploaded_file.name]
+    st.session_state.uploaded_docs = docs + [{"name": uploaded_file.name, "chunks": result}]
+    st.toast(f"{uploaded_file.name}: {result} chunks stored")
 
 
 # ---------- Rendering ----------
-
-def theme_button(key: str) -> None:
-    is_dark = st.session_state.theme == "dark"
-    st.button(
-        "Light mode" if is_dark else "Dark mode",
-        icon=":material/light_mode:" if is_dark else ":material/dark_mode:",
-        key=key,
-        on_click=toggle_theme,
-        use_container_width=True,
-    )
-
 
 def render_sidebar() -> bool:
     """Draw the sidebar. Returns whether agent details should be shown."""
     with st.sidebar:
         st.markdown(LOGO_HTML, unsafe_allow_html=True)
-        st.button("New chat", icon=":material/add:", type="primary",
+        st.button("New chat", icon=":material/add:", key="new_chat",
                   on_click=start_new_chat, use_container_width=True)
 
         uploaded_file = st.file_uploader(
-            "Upload PDF or DOCX", type=["pdf", "docx"], label_visibility="collapsed"
+            "Upload PDF or DOCX", type=["pdf", "docx"], key="uploader", label_visibility="collapsed"
         )
         st.markdown('<p class="dm-hint">Max 20 MB</p>', unsafe_allow_html=True)
         if uploaded_file is not None:
             handle_upload(uploaded_file)
 
-        if st.session_state.uploaded_docs:
+        docs = [d for d in st.session_state.uploaded_docs if isinstance(d, dict)]
+        if docs:
             st.markdown('<p class="dm-label">Documents</p>', unsafe_allow_html=True)
-            for name in st.session_state.uploaded_docs:
-                # Filenames come from users: escape them before putting them in HTML
-                st.markdown(f'<div class="dm-doc"><span>{html.escape(name)}</span></div>',
-                            unsafe_allow_html=True)
+            for doc in docs:
+                st.markdown(doc_item_html(doc["name"], doc.get("chunks")), unsafe_allow_html=True)
 
         st.markdown('<p class="dm-label">History</p>', unsafe_allow_html=True)
         if not st.session_state.chats:
@@ -277,25 +305,51 @@ def render_sidebar() -> bool:
                 use_container_width=True,
             )
 
-        st.markdown("---")
+        st.markdown('<div style="height: 24px"></div>', unsafe_allow_html=True)
         show_details = st.toggle("Show agent details", value=False, key="show_agent_details")
-        theme_button("theme_sidebar")
+        is_dark = st.session_state.theme == "dark"
+        st.button(
+            "Light mode" if is_dark else "Dark mode",
+            icon=":material/light_mode:" if is_dark else ":material/dark_mode:",
+            key="theme_sidebar",
+            on_click=toggle_theme,
+            use_container_width=True,
+        )
     return show_details
 
 
-def render_message(message: dict, show_details: bool) -> None:
-    if message["role"] == "user":
-        with st.chat_message("user"):
-            st.markdown('<span class="dm-user"></span>', unsafe_allow_html=True)
-            st.markdown(sanitize_markdown(message["content"]))
-        return
+def render_header() -> None:
+    is_dark = st.session_state.theme == "dark"
+    title_col, theme_col = st.columns([12, 1], vertical_alignment="center")
+    with title_col:
+        st.markdown('<h1 class="dm-title">Ask your documents</h1>', unsafe_allow_html=True)
+    with theme_col:
+        st.button(
+            "",
+            icon=":material/light_mode:" if is_dark else ":material/dark_mode:",
+            key="theme_header",
+            help="Switch to light mode" if is_dark else "Switch to dark mode",
+            on_click=toggle_theme,
+        )
+    st.markdown('<div class="dm-divider"></div>', unsafe_allow_html=True)
 
-    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        answer = message.get("content", "")
-        if is_no_info(answer):
+
+def render_user(text: str) -> None:
+    st.markdown(user_bubble_html(text), unsafe_allow_html=True)
+
+
+def render_assistant(message: dict, show_details: bool) -> None:
+    answer = message.get("content", "")
+    no_info = is_no_info(answer)
+    avatar_col, body_col = st.columns([1, 15], gap="small")
+    with avatar_col:
+        st.markdown(f'<div class="dm-avatar">{"" if no_info else SPARKLE_SVG}</div>',
+                    unsafe_allow_html=True)
+    with body_col:
+        if no_info:
             st.markdown(f'<p class="dm-noinfo">{html.escape(answer)}</p>', unsafe_allow_html=True)
-        else:
-            st.markdown(sanitize_markdown(answer))
+            return
+        st.markdown(sanitize_markdown(answer))
 
         chips = sources_html(message.get("sources"))
         if chips:
@@ -316,12 +370,7 @@ st.markdown(f"<style>{css_variables(st.session_state.theme)}</style>", unsafe_al
 st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 show_details = render_sidebar()
-
-title_col, theme_col = st.columns([5, 1], vertical_alignment="center")
-with title_col:
-    st.markdown('<h1 class="dm-title">Ask your documents</h1>', unsafe_allow_html=True)
-with theme_col:
-    theme_button("theme_header")
+render_header()
 
 if not st.session_state.chat_history:
     st.markdown(
@@ -330,14 +379,19 @@ if not st.session_state.chat_history:
     )
 
 for message in st.session_state.chat_history:
-    render_message(message, show_details)
+    if message["role"] == "user":
+        render_user(message["content"])
+    else:
+        render_assistant(message, show_details)
 
 user_question = st.chat_input("Ask about your documents…")
 
 if user_question:
-    render_message({"role": "user", "content": user_question}, show_details)
-
-    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+    render_user(user_question)
+    avatar_col, body_col = st.columns([1, 15], gap="small")
+    with avatar_col:
+        st.markdown(f'<div class="dm-avatar">{SPARKLE_SVG}</div>', unsafe_allow_html=True)
+    with body_col:
         with st.spinner("The agent is planning, searching and checking..."):
             ok, payload = ask_backend(user_question)
         if not ok:
