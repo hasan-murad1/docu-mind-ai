@@ -8,6 +8,7 @@ from ui_helpers import (
     THEMES,
     chat_title,
     css_variables,
+    doc_item_html,
     escape_markdown,
     find_chat,
     format_ms,
@@ -18,6 +19,7 @@ from ui_helpers import (
     timeline_rows,
     trace_summary,
     upsert_chat,
+    user_bubble_html,
 )
 
 TRACE = [
@@ -195,3 +197,18 @@ def test_find_chat():
     chats = upsert_chat([], "a", [user("first")])
     assert find_chat(chats, "a")["title"] == "first"
     assert find_chat(chats, "missing") is None
+
+
+# ---------- Small HTML pieces ----------
+
+def test_user_bubble_html_escapes_and_keeps_line_breaks():
+    out = user_bubble_html("<b>hi</b>\nthere")
+    assert "&lt;b&gt;hi&lt;/b&gt;<br>there" in out
+    assert "<b>hi</b>" not in out
+
+
+def test_doc_item_html_escapes_name_and_shows_chunks():
+    out = doc_item_html("<x>.pdf", 9)
+    assert "&lt;x&gt;.pdf" in out
+    assert "9 chunks" in out
+    assert "chunk" not in doc_item_html("a.pdf")

@@ -230,3 +230,29 @@ def upsert_chat(chats, chat_id: str, messages, limit: int = MAX_HISTORY) -> list
 def find_chat(chats, chat_id: str):
     """Return the chat with this id, or None."""
     return next((c for c in (chats or []) if c.get("id") == chat_id), None)
+
+
+
+# ---------- Small HTML pieces (all user text is escaped) ----------
+
+_DOC_ICON = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" aria-hidden="true"><path d="M6 3h9l4 4v14H6z"/></svg>'
+)
+
+
+def user_bubble_html(text) -> str:
+    """The user's question as a right-aligned bubble. Line breaks are kept."""
+    safe = html.escape(str(text or "")).replace("\n", "<br>")
+    return f'<div class="dm-user-row"><div class="dm-user-bubble">{safe}</div></div>'
+
+
+def doc_item_html(name, chunks=None) -> str:
+    """One uploaded document in the sidebar, with its chunk count when known."""
+    sub = ""
+    if isinstance(chunks, int) and not isinstance(chunks, bool):
+        sub = f'<div class="dm-doc-sub">{_plural(chunks, "chunk")}</div>'
+    return (
+        f'<div class="dm-doc">{_DOC_ICON}<div class="dm-doc-text">'
+        f'<div class="dm-doc-name">{html.escape(str(name))}</div>{sub}</div></div>'
+    )
