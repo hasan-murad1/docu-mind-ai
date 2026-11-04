@@ -28,3 +28,8 @@ def test_build_prompt_neutralizes_markers_in_documents():
 def test_no_info_sentence_matches_the_agent():
     assert rag_pipeline.NO_INFO_ANSWER == agent.NO_INFO_ANSWER
     assert rag_pipeline.NO_INFO_ANSWER in build_prompt("q", CHUNKS)
+
+
+
+def test_build_prompt_asks_for_final_answer_only():
+    assert "Never show your thinking" in build_prompt("q", CHUNKS)
