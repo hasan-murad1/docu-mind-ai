@@ -1,16 +1,172 @@
 """DocuMind AI - Streamlit frontend. Talks to the FastAPI backend over HTTP."""
 
 import html
+import uuid
 
 import requests
 import streamlit as st
 
-from ui_helpers import escape_markdown, sanitize_markdown, timeline_lines, trace_summary
+from ui_helpers import (
+    css_variables,
+    doc_item_html,
+    escape_markdown,
+    find_chat,
+    is_no_info,
+    sanitize_markdown,
+    sources_html,
+    timeline_html,
+    trace_summary,
+    upsert_chat,
+    user_bubble_html,
+)
 
 API_BASE_URL = "http://127.0.0.1:8000"
 UPLOAD_TIMEOUT_SECONDS = 120
 ASK_TIMEOUT_SECONDS = 300  # the agent may make several LLM calls per question
 
+# Inline SVG mask for the upload icon (black = visible part of the mask)
+_UPLOAD_MASK = (
+    "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' "
+    "fill='none' stroke='black' stroke-width='2'><path d='M12 16V4M7 9l5-5 5 5'/>"
+    "<path d='M4 16v4h16v-4'/></svg>\")"
+)
+
+# Static styles. Colors come from --dm-* variables, so one stylesheet serves both themes.
+# Widgets are targeted by their key (Streamlit adds a "st-key-<key>" class).
+BASE_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+.stApp { background: var(--dm-bg); color: var(--dm-text); }
+.stApp, .stApp p, .stApp li, .stApp label, .stApp button, .stApp input,
+.stApp textarea, .stApp h1, .stApp summary { font-family: 'Inter Tight', system-ui, sans-serif; }
+.stApp p, .stApp li, .stApp label, .stApp h1, .stApp summary, .stApp strong { color: var(--dm-text); }
+header[data-testid="stHeader"] { background: transparent; }
+.block-container { max-width: 900px; padding-top: 1.5rem; padding-bottom: 7rem; }
+
+/* ---------- Sidebar ---------- */
+section[data-testid="stSidebar"] { background: var(--dm-side); border-right: 1px solid var(--dm-border);
+    min-width: 300px; }
+[data-testid="stSidebarHeader"] { height: 0; min-height: 0; padding: 0; }
+[data-testid="stSidebarUserContent"] { padding-top: 22px; }
+[data-testid="stSidebarCollapseButton"] { display: flex !important; visibility: visible !important;
+    opacity: 1 !important; position: absolute; top: 22px; right: 16px; z-index: 100; }
+[data-testid="stSidebarCollapsedControl"] { display: flex !important; visibility: visible !important;
+    opacity: 1 !important; }
+[data-testid="stSidebarCollapseButton"] button, [data-testid="stSidebarCollapsedControl"] button {
+    width: 36px; height: 36px; border-radius: 8px; border: 1px solid var(--dm-border2) !important;
+    background: var(--dm-surface) !important; }
+[data-testid="stSidebarCollapseButton"] *, [data-testid="stSidebarCollapsedControl"] * {
+    color: var(--dm-text) !important; }
+
+.dm-logo { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.dm-logo-mark { width: 32px; height: 32px; border-radius: 8px; background: var(--dm-accent);
+    display: flex; align-items: center; justify-content: center; }
+.dm-logo-name { font-weight: 700; font-size: 16px; line-height: 1.2; color: var(--dm-text); }
+.stApp .dm-logo-sub, .stApp .dm-label, .stApp .dm-hint, .stApp .dm-muted, .dm-doc-sub { color: var(--dm-muted); }
+.dm-logo-sub { font-size: 12px; }
+.stApp .dm-label { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 14px 0 6px; }
+.stApp .dm-hint { font-size: 12px; text-align: center; margin: -6px 0 4px; }
+.dm-doc { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 10px;
+    background: var(--dm-surface); border: 1px solid var(--dm-border); margin-bottom: 6px;
+    color: var(--dm-accent); }
+.dm-doc-text { min-width: 0; }
+.dm-doc-name { font-size: 13px; color: var(--dm-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-doc-sub { font-size: 11px; }
+
+/* Buttons */
+.stApp .stButton button { border-radius: 10px; min-height: 40px; box-shadow: none; }
+.stApp .stButton button p { color: inherit; font-size: 14px; }
+.st-key-new_chat button { width: 100%; justify-content: flex-start; background: var(--dm-surface) !important;
+    border: 1px solid var(--dm-border2) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button { width: 100%; justify-content: flex-start; background: transparent !important;
+    border: 1px solid transparent !important; color: var(--dm-muted) !important; }
+[class*="st-key-chat_"] button:hover { background: var(--dm-surface) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button[kind="primary"] { background: var(--dm-bubble) !important; color: var(--dm-text) !important; }
+[class*="st-key-chat_"] button div, [class*="st-key-chat_"] button p { min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+.st-key-theme_sidebar button { width: 100%; justify-content: flex-start; min-height: 44px;
+    background: transparent !important; border: 1px solid var(--dm-border) !important; color: var(--dm-text) !important; }
+.st-key-theme_header { display: flex; justify-content: flex-end; }
+.st-key-theme_header button { width: 44px; height: 44px; padding: 0; background: transparent !important;
+    border: 1px solid var(--dm-border2) !important; color: var(--dm-text) !important; }
+.st-key-show_agent_details { border: 1px solid var(--dm-border); border-radius: 10px; padding: 10px 12px; }
+
+/* Compact uploader: one pill button with an icon */
+.st-key-uploader [data-testid="stFileUploaderDropzone"] { padding: 0 !important; border: 0 !important;
+    background: transparent !important; min-height: 0; }
+.st-key-uploader [data-testid="stFileUploaderDropzoneInstructions"],
+.st-key-uploader [data-testid="stFileUploaderFile"],
+.st-key-uploader [data-testid="stFileUploaderPagination"] { display: none !important; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button { width: 100%; height: 42px; border-radius: 999px;
+    border: 1px solid var(--dm-border2) !important; background: var(--dm-surface) !important; font-size: 0;
+    display: flex; align-items: center; justify-content: center; gap: 8px; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button::before { content: ""; width: 15px; height: 15px;
+    background-color: var(--dm-text); -webkit-mask: UPLOAD_MASK center / contain no-repeat;
+    mask: UPLOAD_MASK center / contain no-repeat; }
+.st-key-uploader [data-testid="stFileUploaderDropzone"] button::after { content: "Upload PDF or DOCX";
+    font-size: 14px; font-weight: 500; color: var(--dm-text); }
+
+/* ---------- Main area ---------- */
+.stApp h1.dm-title { font-size: 20px; font-weight: 600; margin: 0; padding: 0; }
+.dm-divider { height: 1px; background: var(--dm-border); margin: 8px 0 24px; }
+.dm-empty { border: 1px dashed var(--dm-border2); border-radius: 12px; padding: 18px;
+    color: var(--dm-muted); font-size: 14px; }
+.dm-user-row { display: flex; justify-content: flex-end; margin: 4px 0 18px; }
+.dm-user-bubble { max-width: 70%; background: var(--dm-bubble); color: var(--dm-text);
+    border-radius: 16px 16px 4px 16px; padding: 12px 16px; font-size: 15px; line-height: 1.5;
+    overflow-wrap: anywhere; }
+.dm-avatar { width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--dm-border2);
+    display: flex; align-items: center; justify-content: center; color: var(--dm-accent); margin-top: 2px; }
+.stApp p.dm-noinfo { color: var(--dm-muted); font-size: 15px; margin: 4px 0 18px; }
+
+/* Sources and agent timeline */
+.dm-sources { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 8px; }
+.dm-chip { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--dm-border2);
+    color: var(--dm-muted); }
+[data-testid="stExpander"] details { background: var(--dm-side) !important; border: 1px solid var(--dm-border) !important;
+    border-radius: 12px; }
+[data-testid="stExpander"] summary p { font-size: 13px; font-weight: 600; }
+[data-testid="stExpander"] summary svg { color: var(--dm-text); }
+.dm-steps { list-style: none; margin: 0; padding: 4px 0; display: flex; flex-direction: column; gap: 10px; }
+.dm-steps li { display: grid; grid-template-columns: 14px 120px 1fr auto; gap: 10px; align-items: center;
+    margin: 0; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--dm-text); }
+.dm-dot { width: 8px; height: 8px; border-radius: 4px; background: var(--dm-accent); }
+.dm-dot-ok { background: var(--dm-ok); }
+.dm-dot-warn { background: var(--dm-warn); }
+
+/* Chat input */
+[data-testid="stBottom"], [data-testid="stBottom"] > div,
+[data-testid="stBottomBlockContainer"] { background: var(--dm-bg) !important; }
+[data-testid="stBottomBlockContainer"] { max-width: 900px; margin: 0 auto; padding-bottom: 24px; }
+[data-testid="stChatInput"], [data-testid="stChatInput"] > div { background: var(--dm-input) !important;
+    border-color: var(--dm-border2) !important; border-radius: 14px !important; }
+[data-testid="stChatInput"] textarea { color: var(--dm-text) !important; background: transparent !important;
+    caret-color: var(--dm-text); }
+[data-testid="stChatInput"] textarea::placeholder { color: var(--dm-muted) !important; opacity: 1; }
+[data-testid="stChatInputSubmitButton"] { background: var(--dm-accent) !important; border-radius: 10px !important; }
+[data-testid="stChatInputSubmitButton"] svg { color: #0B0B0C !important; fill: #0B0B0C !important; }
+</style>
+""".replace("UPLOAD_MASK", _UPLOAD_MASK)
+
+LOGO_HTML = """
+<div class="dm-logo">
+  <div class="dm-logo-mark">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0B0B0C" stroke-width="2.2" aria-hidden="true">
+      <path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/>
+    </svg>
+  </div>
+  <div><div class="dm-logo-name">DocuMind AI</div><div class="dm-logo-sub">Agentic RAG</div></div>
+</div>
+"""
+
+SPARKLE_SVG = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+    'aria-hidden="true"><path d="M12 3l2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/></svg>'
+)
+
+
+# ---------- Backend calls ----------
 
 def get_error_detail(response) -> str:
     """Safely read an error message even if the server didn't return JSON."""
@@ -24,211 +180,218 @@ def ask_backend(question: str):
     """Send a question to the API. Returns (True, result) or (False, error message)."""
     try:
         response = requests.post(
-            f"{API_BASE_URL}/ask",
-            json={"question": question},
-            timeout=ASK_TIMEOUT_SECONDS,
+            f"{API_BASE_URL}/ask", json={"question": question}, timeout=ASK_TIMEOUT_SECONDS
         )
     except requests.exceptions.ConnectionError:
         return False, "Could not connect to the backend server. Is it running?"
     except requests.exceptions.Timeout:
         return False, "The agent took too long to answer. Please try again."
-
     if response.status_code != 200:
         return False, f"Error: {get_error_detail(response)}"
     return True, response.json()
 
 
-def render_answer_extras(message: dict, show_details: bool) -> None:
-    """Show the sources under an answer, and the agent timeline if enabled."""
-    sources = message.get("sources") or []
-    if sources:
-        st.caption("📎 " + " · ".join(escape_markdown(s) for s in sources))
+def upload_backend(uploaded_file):
+    """Send a file to the API. Returns (True, chunk count) or (False, error message)."""
+    try:
+        files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
+        response = requests.post(
+            f"{API_BASE_URL}/upload", files=files, timeout=UPLOAD_TIMEOUT_SECONDS
+        )
+    except requests.exceptions.ConnectionError:
+        return False, "Could not connect to the backend server. Is it running?"
+    except requests.exceptions.Timeout:
+        return False, "Processing took too long. Please try again."
+    if response.status_code != 200:
+        return False, f"Error: {get_error_detail(response)}"
+    return True, int(response.json().get("chunks_stored", 0))
 
-    trace = message.get("trace") or []
-    if show_details and trace:
-        with st.expander(f"🔍 Agent details ({trace_summary(trace)})", expanded=False):
-            st.markdown("  \n".join(timeline_lines(trace)))
+
+# ---------- Session state ----------
+
+def new_chat_id() -> str:
+    return uuid.uuid4().hex[:8]
 
 
-st.set_page_config(page_title="DocuMind AI", page_icon="📄", layout="wide")
+def init_state() -> None:
+    defaults = {
+        "theme": "dark",
+        "chats": [],               # saved chats, newest first (this browser session only)
+        "current_chat_id": new_chat_id(),
+        "chat_history": [],        # messages of the open chat
+        "uploaded_docs": [],       # [{"name": ..., "chunks": ...}]
+        "processed_uploads": [],   # files already sent, so reruns don't upload twice
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# --- Custom CSS ---
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #000000;
-    }
-    .block-container { padding-top: 2rem; }
 
-    section[data-testid="stSidebar"] {
-        background-color: #0D0D0D;
-        border-right: 1px solid #1F1F1F;
-    }
-    section[data-testid="stSidebar"] * {
-        color: #E5E7EB !important;
-    }
-    section[data-testid="stSidebar"] .stButton button {
-        background-color: rgba(255,255,255,0.08);
-        border: 1px solid rgba(255,255,255,0.15);
-        color: #FFFFFF !important;
-        text-align: left;
-        border-radius: 8px;
-    }
-    section[data-testid="stSidebar"] .stButton button:hover {
-        background-color: rgba(255,255,255,0.18);
-        border: 1px solid rgba(255,255,255,0.3);
-    }
-
-    .app-title {
-        font-size: 2.6rem;
-        font-weight: 800;
-        color: #F3F4F6;
-        margin-top: 10px;
-        margin-bottom: 0;
-        line-height: 1.2;
-    }
-    .app-subtitle {
-        font-size: 1.05rem;
-        color: #9CA3AF;
-        margin-top: 0.2rem;
-        margin-bottom: 1.5rem;
-    }
-    .doc-item {
-        background-color: rgba(255,255,255,0.06);
-        border-radius: 8px;
-        padding: 0.5rem 0.8rem;
-        margin-bottom: 0.4rem;
-        font-size: 0.8rem;
-    }
-    .user-profile {
-        background-color: rgba(255,255,255,0.06);
-        border-radius: 10px;
-        padding: 0.6rem 0.8rem;
-        margin-top: 1rem;
-        font-size: 0.8rem;
-    }
-
-    /* Native chat messages on the dark background */
-    [data-testid="stChatMessage"] {
-        background-color: #0D0D0D;
-        border: 1px solid #1F1F1F;
-        border-radius: 12px;
-    }
-    [data-testid="stChatMessage"] p,
-    [data-testid="stChatMessage"] li,
-    [data-testid="stChatMessage"] span,
-    [data-testid="stChatMessage"] strong {
-        color: #E5E7EB;
-    }
-
-    /* Agent details expander */
-    [data-testid="stExpander"] details {
-        background-color: #0A0A0A;
-        border: 1px solid #2D2D2D;
-    }
-    [data-testid="stExpander"] summary,
-    [data-testid="stExpander"] p {
-        color: #E5E7EB;
-    }
-
-    [data-testid="stFileUploaderDropzoneInstructions"] span,
-    [data-testid="stFileUploaderDropzoneInstructions"] small {
-        display: none;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# --- Session state ---
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "uploaded_docs" not in st.session_state:
-    st.session_state.uploaded_docs = []
-
-# --- Sidebar ---
-with st.sidebar:
-    st.markdown("### 📄 DocuMind AI")
-    st.caption("Your AI Knowledge Assistant")
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-
-    if st.button("➕  New Chat", use_container_width=True):
-        st.session_state.chat_history = []
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("**📤 Upload a Document**")
-    uploaded_file = st.file_uploader(
-        "Choose a PDF or DOCX file",
-        type=["pdf", "docx"],
-        label_visibility="collapsed",
+def save_current_chat() -> None:
+    st.session_state.chats = upsert_chat(
+        st.session_state.chats, st.session_state.current_chat_id, st.session_state.chat_history
     )
-    st.caption("📁 Drag and drop file here • Limit 20MB • PDF, DOCX")
 
-    if uploaded_file is not None:
-        if st.button("Process Document", use_container_width=True):
-            with st.spinner("Processing document..."):
-                try:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-                    response = requests.post(
-                        f"{API_BASE_URL}/upload", files=files, timeout=UPLOAD_TIMEOUT_SECONDS
-                    )
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.success(f"✅ {result['chunks_stored']} chunks stored")
-                        if uploaded_file.name not in st.session_state.uploaded_docs:
-                            st.session_state.uploaded_docs.append(uploaded_file.name)
-                    else:
-                        st.error(f"Error: {get_error_detail(response)}")
-                except requests.exceptions.ConnectionError:
-                    st.error("Could not connect to the backend server. Is it running?")
-                except requests.exceptions.Timeout:
-                    st.error("Processing took too long. Please try again.")
 
-    st.markdown("---")
-    show_details = st.toggle("🧠 Show agent details", value=False, key="show_agent_details")
-    st.caption("See how the agent planned, searched and checked each answer.")
+def start_new_chat() -> None:
+    save_current_chat()
+    st.session_state.current_chat_id = new_chat_id()
+    st.session_state.chat_history = []
 
-    if st.session_state.uploaded_docs:
-        st.markdown("---")
-        st.markdown("**Recent Documents**")
-        for doc_name in st.session_state.uploaded_docs:
-            # Filenames come from users: escape them before putting them in HTML
-            st.markdown(
-                f'<div class="doc-item">📄 {html.escape(doc_name)}</div>',
-                unsafe_allow_html=True,
+
+def open_chat(chat_id: str) -> None:
+    save_current_chat()
+    chat = find_chat(st.session_state.chats, chat_id)
+    if chat is not None:
+        st.session_state.current_chat_id = chat_id
+        st.session_state.chat_history = list(chat["messages"])
+
+
+def toggle_theme() -> None:
+    st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
+
+
+def handle_upload(uploaded_file) -> None:
+    """Upload a newly selected file once, then list it under Documents."""
+    upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
+    if upload_key in st.session_state.processed_uploads:
+        return
+    st.session_state.processed_uploads.append(upload_key)
+    with st.spinner("Processing document..."):
+        ok, result = upload_backend(uploaded_file)
+    if not ok:
+        st.error(result)
+        return
+    docs = [d for d in st.session_state.uploaded_docs
+            if isinstance(d, dict) and d.get("name") != uploaded_file.name]
+    st.session_state.uploaded_docs = docs + [{"name": uploaded_file.name, "chunks": result}]
+    st.toast(f"{uploaded_file.name}: {result} chunks stored")
+
+
+# ---------- Rendering ----------
+
+def render_sidebar() -> bool:
+    """Draw the sidebar. Returns whether agent details should be shown."""
+    with st.sidebar:
+        st.markdown(LOGO_HTML, unsafe_allow_html=True)
+        st.button("New chat", icon=":material/add:", key="new_chat",
+                  on_click=start_new_chat, use_container_width=True)
+
+        uploaded_file = st.file_uploader(
+            "Upload PDF or DOCX", type=["pdf", "docx"], key="uploader", label_visibility="collapsed"
+        )
+        st.markdown('<p class="dm-hint">Max 20 MB</p>', unsafe_allow_html=True)
+        if uploaded_file is not None:
+            handle_upload(uploaded_file)
+
+        docs = [d for d in st.session_state.uploaded_docs if isinstance(d, dict)]
+        if docs:
+            st.markdown('<p class="dm-label">Documents</p>', unsafe_allow_html=True)
+            for doc in docs:
+                st.markdown(doc_item_html(doc["name"], doc.get("chunks")), unsafe_allow_html=True)
+
+        st.markdown('<p class="dm-label">History</p>', unsafe_allow_html=True)
+        if not st.session_state.chats:
+            st.markdown('<p class="dm-hint" style="text-align:left">No chats yet</p>',
+                        unsafe_allow_html=True)
+        for chat in st.session_state.chats:
+            is_open = chat["id"] == st.session_state.current_chat_id
+            st.button(
+                escape_markdown(chat["title"]),
+                key=f"chat_{chat['id']}",
+                type="primary" if is_open else "secondary",
+                on_click=open_chat,
+                args=(chat["id"],),
+                use_container_width=True,
             )
 
+        st.markdown('<div style="height: 24px"></div>', unsafe_allow_html=True)
+        show_details = st.toggle("Show agent details", value=False, key="show_agent_details")
+        is_dark = st.session_state.theme == "dark"
+        st.button(
+            "Light mode" if is_dark else "Dark mode",
+            icon=":material/light_mode:" if is_dark else ":material/dark_mode:",
+            key="theme_sidebar",
+            on_click=toggle_theme,
+            use_container_width=True,
+        )
+    return show_details
+
+
+def render_header() -> None:
+    is_dark = st.session_state.theme == "dark"
+    title_col, theme_col = st.columns([12, 1], vertical_alignment="center")
+    with title_col:
+        st.markdown('<h1 class="dm-title">Ask your documents</h1>', unsafe_allow_html=True)
+    with theme_col:
+        st.button(
+            "",
+            icon=":material/light_mode:" if is_dark else ":material/dark_mode:",
+            key="theme_header",
+            help="Switch to light mode" if is_dark else "Switch to dark mode",
+            on_click=toggle_theme,
+        )
+    st.markdown('<div class="dm-divider"></div>', unsafe_allow_html=True)
+
+
+def render_user(text: str) -> None:
+    st.markdown(user_bubble_html(text), unsafe_allow_html=True)
+
+
+def render_assistant(message: dict, show_details: bool) -> None:
+    answer = message.get("content", "")
+    no_info = is_no_info(answer)
+    avatar_col, body_col = st.columns([1, 15], gap="small")
+    with avatar_col:
+        st.markdown(f'<div class="dm-avatar">{"" if no_info else SPARKLE_SVG}</div>',
+                    unsafe_allow_html=True)
+    with body_col:
+        if no_info:
+            st.markdown(f'<p class="dm-noinfo">{html.escape(answer)}</p>', unsafe_allow_html=True)
+            return
+        st.markdown(sanitize_markdown(answer))
+
+        chips = sources_html(message.get("sources"))
+        if chips:
+            st.markdown(chips, unsafe_allow_html=True)
+
+        trace = message.get("trace") or []
+        if show_details and trace:
+            with st.expander(f"Agent details · {trace_summary(trace)}", expanded=False):
+                st.markdown(timeline_html(trace), unsafe_allow_html=True)
+
+
+# ---------- Page ----------
+
+st.set_page_config(page_title="DocuMind AI", page_icon="📄", layout="wide")
+init_state()
+
+st.markdown(f"<style>{css_variables(st.session_state.theme)}</style>", unsafe_allow_html=True)
+st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+show_details = render_sidebar()
+render_header()
+
+if not st.session_state.chat_history:
     st.markdown(
-        '<div class="user-profile">👤 <b>Your Session</b><br>Agentic RAG Assistant</div>',
+        '<div class="dm-empty">Upload a document from the sidebar, then ask a question below.</div>',
         unsafe_allow_html=True,
     )
 
-# --- Header ---
-st.markdown('<p class="app-title">📄 DocuMind AI</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="app-subtitle">Upload a document and ask questions. An AI agent plans, '
-    'searches, and checks every answer against your documents.</p>',
-    unsafe_allow_html=True,
-)
-
-# --- Chat history (native chat: markdown works, raw HTML is not rendered) ---
-if not st.session_state.chat_history:
-    st.info("👋 Upload a document from the sidebar, then ask a question below to get started.")
-
 for message in st.session_state.chat_history:
-    avatar = "🧑" if message["role"] == "user" else "🤖"
-    with st.chat_message(message["role"], avatar=avatar):
-        st.markdown(sanitize_markdown(message["content"]))
-        if message["role"] == "assistant":
-            render_answer_extras(message, show_details)
+    if message["role"] == "user":
+        render_user(message["content"])
+    else:
+        render_assistant(message, show_details)
 
-# --- Chat input: pinned to the bottom of the page ---
-user_question = st.chat_input("Ask a question about your documents...")
+user_question = st.chat_input("Ask about your documents…")
 
 if user_question:
-    with st.chat_message("user", avatar="🧑"):
-        st.markdown(sanitize_markdown(user_question))
-
-    with st.chat_message("assistant", avatar="🤖"):
+    render_user(user_question)
+    avatar_col, body_col = st.columns([1, 15], gap="small")
+    with avatar_col:
+        st.markdown(f'<div class="dm-avatar">{SPARKLE_SVG}</div>', unsafe_allow_html=True)
+    with body_col:
         with st.spinner("The agent is planning, searching and checking..."):
             ok, payload = ask_backend(user_question)
         if not ok:
@@ -242,4 +405,5 @@ if user_question:
             "sources": payload.get("sources", []),
             "trace": payload.get("trace", []),
         })
+        save_current_chat()
         st.rerun()

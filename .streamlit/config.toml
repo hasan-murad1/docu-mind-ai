@@ -1,0 +1,10 @@
+[theme]
+# Widgets start from the dark base; the app's own CSS switches dark/light colors
+base = "dark"
+# Amber accent used by toggles and focus rings
+primaryColor = "#F5B544"
+font = "sans serif"
+
+[client]
+# Hide the developer toolbar items for a cleaner demo
+toolbarMode = "minimal"

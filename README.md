@@ -18,6 +18,8 @@ When the answer is "no information", no source is shown. That exact bug is what 
 
 In the sidebar you can turn on **Show agent details**. Each answer then gets a small timeline: which tool was used, how many chunks came back, whether there was a retry, and how long each step took.
 
+The UI has a light and a dark theme, a sidebar you can hide, and a history of your chats. The history only lives in your browser session, so nothing is saved on the server.
+
 ## A couple of examples
 
 These come from a fictional company knowledge base I use for testing:
@@ -86,7 +88,7 @@ On Groq's free tier you will sometimes see slower answers. Each question uses ab
 python -m pytest -q
 ```
 
-There are 210 tests. None of them call a real LLM. The agent tests use scripted fake responses, so they're fast and give the same result every run.
+There are 234 tests. None of them call a real LLM. The agent tests use scripted fake responses, so they're fast and give the same result every run.
 
 ## API
 
@@ -163,6 +165,7 @@ docu-mind-ai/
 
 - **v1.0**: plain RAG pipeline
 - **v2.0**: agentic RAG with a planner, three search tools, an evaluate and retry loop, a self-check, and an agent trace in the UI
+- **v2.1**: redesigned UI with light and dark themes, a collapsible sidebar, session chat history and a cleaner agent timeline
 
 ## License
 
