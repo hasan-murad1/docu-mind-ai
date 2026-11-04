@@ -104,3 +104,10 @@ def test_long_draft_is_truncated_in_prompt():
     prompt = build_self_check_prompt("q", long_draft, CHUNKS)
     assert "y" * MAX_DRAFT_CHARS_IN_PROMPT in prompt
     assert "y" * (MAX_DRAFT_CHARS_IN_PROMPT + 1) not in prompt
+
+
+def test_prompt_rejects_drafts_that_change_their_answer():
+    prompt = build_self_check_prompt("q", "Yes. Wait, actually no.", CHUNKS)
+    assert "changes its answer partway" in prompt
+
+    
