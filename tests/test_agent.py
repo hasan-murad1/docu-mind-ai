@@ -1,4 +1,4 @@
-"""Tests for the agent core: trace, budget, daily cap, planning, retry loop, self-check."""
+"""Tests for the agent core: trace, budget, daily cap, planning, retry loop, self-check, sources."""
 
 import json
 import time
@@ -20,6 +20,7 @@ from agent import (
     merge_chunks,
     run_agent,
     run_tool,
+    select_sources,
     validate_question,
 )
 from planner import ALLOWED_TOOLS
@@ -329,7 +330,7 @@ def test_default_tools_match_allowed_tools():
     assert set(default_tools().keys()) == set(ALLOWED_TOOLS)
 
 
-# ---------- Phase 5: evaluate + rewrite loop ----------
+# ---------- Evaluate + rewrite loop ----------
 
 def test_rewrite_then_success():
     llm = ScriptedLLM(PLAN_VECTOR, not_enough("better query"), EVAL_ENOUGH, "the answer", CHECK_OK)
@@ -434,7 +435,7 @@ def test_merge_chunks_dedupes_sorts_and_caps():
     assert [c["distance"] for c in capped] == sorted(c["distance"] for c in capped)
 
 
-# ---------- Phase 6: draft + self-check ----------
+# ---------- Draft + self-check ----------
 
 def test_no_info_draft_hides_sources_and_skips_self_check():
     llm = ScriptedLLM(PLAN_VECTOR, EVAL_ENOUGH, NO_INFO_ANSWER)
@@ -503,3 +504,23 @@ def test_self_check_receives_the_draft():
     tools, _ = make_tools({"vector_search": NEAR})
     run(llm=llm, tools=tools)
     assert "<draft>\nthe answer\n</draft>" in llm.prompts[3]
+
+
+# ---------- Sources ----------
+
+def test_select_sources_drops_weak_files():
+    chunks = [
+        {"text": "x", "source": "velora.pdf", "distance": 0.9},
+        {"text": "y", "source": "velora.pdf", "distance": 1.2},
+        {"text": "z", "source": "novacart.pdf", "distance": 1.7},
+    ]
+    assert select_sources(chunks) == ["velora.pdf"]
+
+
+def test_select_sources_keeps_files_that_are_close():
+    chunks = [
+        {"text": "x", "source": "b.pdf", "distance": 0.8},
+        {"text": "y", "source": "a.pdf", "distance": 1.1},
+    ]
+    assert select_sources(chunks) == ["a.pdf", "b.pdf"]
+    assert select_sources([]) == []

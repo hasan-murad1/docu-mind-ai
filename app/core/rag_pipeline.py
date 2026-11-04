@@ -62,6 +62,7 @@ Important rules:
 - If the context clearly discusses the topic being asked about, answer using the information and any straightforward comparisons or calculations needed (for example, comparing a number in the question to a number in the context).
 - If the question asks about something that is NOT mentioned anywhere in the context at all (a different topic, person, or fact), reply exactly: "{NO_INFO_ANSWER}"
 - Do not write creative content (poems, stories, etc.) — only answer factual questions based on the context.
+- Write only the final answer, in a few short sentences. If a calculation is needed, show it in one short line. Never show your thinking, never start over, and never write phrases like "Wait" or "let me re-read".
 
 Answer:"""
 
