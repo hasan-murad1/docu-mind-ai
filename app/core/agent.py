@@ -23,6 +23,9 @@ MAX_LLM_CALLS_PER_QUESTION = 8   # worst case: 1 plan + 4 evaluate + 1 draft + 1
 MAX_CONTEXT_CHUNKS = 8           # chunks kept across retries (best distance first)
 DEFAULT_TOP_K = 7
 
+# A file is shown as a source only if its closest chunk is this close to the best chunk
+SOURCE_DISTANCE_MARGIN = 0.5
+
 # Safe default tool: used when the plan is invalid, the chosen tool finds
 # nothing, and for every retry with a rewritten query (broadest search)
 FALLBACK_TOOL = "vector_search"
@@ -219,6 +222,22 @@ def _retrieve(
     return relevant
 
 
+def select_sources(chunks: list[dict], margin: float = SOURCE_DISTANCE_MARGIN) -> list[str]:
+    """
+    Files to show as sources: only those whose closest chunk is within `margin`
+    of the best chunk overall. A file that only matched weakly is left out.
+    """
+    best_per_source: dict = {}
+    for chunk in chunks:
+        source, distance = chunk["source"], chunk["distance"]
+        if source not in best_per_source or distance < best_per_source[source]:
+            best_per_source[source] = distance
+    if not best_per_source:
+        return []
+    best = min(best_per_source.values())
+    return sorted(s for s, d in best_per_source.items() if d <= best + margin)
+
+
 def merge_chunks(
     existing: list[dict],
     new: list[dict],
@@ -400,7 +419,7 @@ def run_agent(
     else:
         return finish_no_info("finish_no_info")
 
-    sources_used = sorted(set(c["source"] for c in context))
+    sources_used = select_sources(context)
     return {"answer": answer, "sources": sources_used, "trace": trace.to_list()}
 
 
