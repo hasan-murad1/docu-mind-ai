@@ -1,6 +1,6 @@
 # DocuMind AI 📄
 
-![DocuMind AI Demo](assets/demo.gif)
+![DocuMind AI Demo](assets/documind-demo.gif)
 
 DocuMind AI lets you upload a PDF or Word file and ask questions about it. It answers from the document, shows which file the answer came from, and tells you plainly when the document doesn't contain the answer.
 
