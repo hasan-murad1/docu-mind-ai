@@ -1,4 +1,10 @@
-"""API tests for /ask: agent result, limits and error mapping (the agent is faked)."""
+"""API tests for /ask and /upload: agent result, per-visitor limits and error mapping.
+
+The agent and the vector store are faked, so no model or network is used.
+"""
+
+from datetime import date
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -7,7 +13,16 @@ from fastapi.testclient import TestClient
 import main
 import usage_limiter
 from agent import DailyCapExceeded, LLMBudgetExceeded
-from usage_limiter import MAX_QUESTION_LENGTH, MAX_REQUESTS_PER_MINUTE
+from usage_limiter import (
+    MAX_QUESTION_LENGTH,
+    MAX_QUESTIONS_PER_DAY,
+    MAX_QUESTIONS_PER_MINUTE,
+    MAX_UPLOADS_PER_DAY,
+    MAX_UPLOADS_PER_MINUTE,
+    VisitorLimiter,
+)
+
+VISITOR = "testclient"  # the client host that FastAPI's TestClient reports
 
 TRACE_STEP = {
     "step": "plan", "tool": "llm", "chunks_retrieved": 0, "best_distance": None,
@@ -22,10 +37,34 @@ def http_error(status):
     return requests.exceptions.HTTPError(response=response)
 
 
+class FakeTime:
+    """Controllable clock and calendar day for the limiters."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.day = date(2026, 11, 17)
+
+    def clock(self):
+        return self.now
+
+    def today(self):
+        return self.day
+
+
 @pytest.fixture
-def api(monkeypatch):
-    """Test client with a fake agent and a fresh rate limiter."""
-    usage_limiter._request_times.clear()
+def api(monkeypatch, tmp_path):
+    """Test client with a fake agent, fake storage and fresh per-visitor limiters."""
+    fake_time = FakeTime()
+    questions = VisitorLimiter(MAX_QUESTIONS_PER_MINUTE, MAX_QUESTIONS_PER_DAY,
+                               clock=fake_time.clock, today=fake_time.today)
+    uploads = VisitorLimiter(MAX_UPLOADS_PER_MINUTE, MAX_UPLOADS_PER_DAY,
+                             clock=fake_time.clock, today=fake_time.today)
+    monkeypatch.setattr(main, "question_limiter", questions)
+    monkeypatch.setattr(main, "upload_limiter", uploads)
+    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(main, "extract_text", lambda path: "some readable text " * 20)
+    monkeypatch.setattr(main, "add_chunks_to_store", lambda chunks, source_filename: len(chunks))
+
     calls = []
     behaviour = {"result": GOOD_RESULT, "error": None}
 
@@ -36,33 +75,40 @@ def api(monkeypatch):
         return behaviour["result"]
 
     monkeypatch.setattr(main, "run_agent", fake_run_agent)
-    return TestClient(main.app), calls, behaviour
+    return SimpleNamespace(
+        client=TestClient(main.app), calls=calls, behaviour=behaviour,
+        time=fake_time, questions=questions, uploads=uploads,
+    )
 
 
 def ask(client, question="What stores embeddings?"):
     return client.post("/ask", json={"question": question})
 
 
+def upload(client, name="notes.pdf", content=b"%PDF-1.4 test"):
+    return client.post("/upload", files={"file": (name, content)})
+
+
+# ---------- /ask ----------
+
 def test_ask_returns_answer_sources_and_trace(api):
-    client, calls, _ = api
-    response = ask(client, "  What stores embeddings?  ")
+    response = ask(api.client, "  What stores embeddings?  ")
     assert response.status_code == 200
     assert response.json() == GOOD_RESULT
-    assert calls == ["What stores embeddings?"]  # validated and stripped
+    assert api.calls == ["What stores embeddings?"]  # validated and stripped
 
 
 def test_ask_does_not_charge_daily_cap_upfront(api):
-    client, _, _ = api
     before = usage_limiter._daily_counter["count"]
-    ask(client)
+    ask(api.client)
     assert usage_limiter._daily_counter["count"] == before
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "x" * (MAX_QUESTION_LENGTH + 1)])
-def test_ask_rejects_bad_questions_before_running_agent(api, bad):
-    client, calls, _ = api
-    assert ask(client, bad).status_code == 400
-    assert calls == []
+def test_ask_rejects_bad_questions_without_using_quota(api, bad):
+    assert ask(api.client, bad).status_code == 400
+    assert api.calls == []
+    assert api.questions.remaining_today(VISITOR) == MAX_QUESTIONS_PER_DAY
 
 
 @pytest.mark.parametrize(
@@ -75,24 +121,52 @@ def test_ask_rejects_bad_questions_before_running_agent(api, bad):
         (requests.exceptions.ConnectionError(), 503),
     ],
 )
-def test_ask_maps_errors_to_status_codes(api, error, status):
-    client, _, behaviour = api
-    behaviour["error"] = error
-    response = ask(client)
+def test_ask_maps_errors_and_gives_the_question_back(api, error, status):
+    api.behaviour["error"] = error
+    response = ask(api.client)
     assert response.status_code == status
     assert "detail" in response.json()
+    assert api.questions.remaining_today(VISITOR) == MAX_QUESTIONS_PER_DAY
 
 
-def test_ask_rate_limit_per_client(api):
-    client, _, _ = api
-    for _ in range(MAX_REQUESTS_PER_MINUTE):
-        assert ask(client).status_code == 200
-    assert ask(client).status_code == 429
+def test_ask_daily_limit_without_waiting(api):
+    # All daily questions can be asked back to back (no per-minute limit)
+    for _ in range(MAX_QUESTIONS_PER_DAY):
+        assert ask(api.client).status_code == 200
+    blocked = ask(api.client)
+    assert blocked.status_code == 429
+    assert "today" in blocked.json()["detail"]
+    # Next day: both the date and the clock move forward, like in real life
+    api.time.day = date(2026, 11, 18)
+    api.time.now += 24 * 60 * 60
+    assert ask(api.client).status_code == 200
 
 
 def test_response_drops_unexpected_trace_fields(api):
-    client, _, behaviour = api
-    behaviour["result"] = {**GOOD_RESULT, "trace": [{**TRACE_STEP, "prompt": "SECRET_PROMPT"}]}
-    response = ask(client)
+    api.behaviour["result"] = {**GOOD_RESULT, "trace": [{**TRACE_STEP, "prompt": "SECRET_PROMPT"}]}
+    response = ask(api.client)
     assert response.status_code == 200
     assert "SECRET_PROMPT" not in response.text
+
+
+# ---------- /upload ----------
+
+def test_upload_valid_file(api):
+    response = upload(api.client)
+    assert response.status_code == 200
+    assert response.json()["chunks_stored"] == 1
+
+
+def test_upload_daily_limit_without_waiting(api):
+    for _ in range(MAX_UPLOADS_PER_DAY):
+        assert upload(api.client).status_code == 200
+    blocked = upload(api.client)
+    assert blocked.status_code == 429
+    assert "today" in blocked.json()["detail"]
+
+
+def test_rejected_upload_does_not_use_quota(api):
+    for _ in range(5):
+        assert upload(api.client, name="notes.txt").status_code == 400
+    assert api.uploads.remaining_today(VISITOR) == MAX_UPLOADS_PER_DAY
+    assert upload(api.client).status_code == 200
