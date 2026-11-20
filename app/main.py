@@ -19,6 +19,13 @@ sys.path.append(str(Path(__file__).parent / "core"))
 from agent import DailyCapExceeded, LLMBudgetExceeded, run_agent, validate_question
 from document_processor import extract_text, chunk_text
 from vector_store import add_chunks_to_store
+from upload_security import (
+    MAX_UPLOAD_BYTES,
+    UploadRejected,
+    check_extracted_text,
+    clean_filename,
+    validate_upload,
+)
 from usage_limiter import (
     LIMIT_DAY,
     MAX_QUESTIONS_PER_DAY,
@@ -29,9 +36,7 @@ from usage_limiter import (
 
 app = FastAPI(title="DocuMind AI")
 
-# --- Security settings ---
-ALLOWED_EXTENSIONS = {".pdf", ".docx"}
-MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+# Uploaded files are written here only while their text is extracted
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -104,49 +109,49 @@ def root():
     return {"status": "DocuMind AI API is running"}
 
 
+async def read_upload(file: UploadFile) -> bytes:
+    """Read the upload into memory, stopping as soon as it passes the size limit."""
+    data = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        data.extend(chunk)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=400, detail="File too large. Max allowed size is 5 MB.")
+    return bytes(data)
+
+
 async def process_upload(file: UploadFile) -> dict:
-    """Validate, save, extract, chunk and store one uploaded file."""
-    filename = file.filename or ""
+    """Check, extract, chunk and store one uploaded file. The file itself is not kept."""
+    display_name = clean_filename(file.filename)
+    data = await read_upload(file)
 
-    # 1. Validate file extension
-    extension = Path(filename).suffix.lower()
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{extension}'. Only PDF and DOCX are allowed.",
-        )
-
-    # 2. Safe, unique filename (prevents path traversal)
-    safe_filename = f"{uuid.uuid4().hex}{extension}"
-    save_path = UPLOAD_DIR / safe_filename
-
-    # 3. Save file while enforcing the size limit
-    size = 0
-    with open(save_path, "wb") as buffer:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if size > MAX_FILE_SIZE_BYTES:
-                buffer.close()
-                save_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=400,
-                    detail="File too large. Max allowed size is 20MB.",
-                )
-            buffer.write(chunk)
-
-    # 4. Extract, chunk, embed, store
+    # 1. Security checks on the real content (size, type, pages)
     try:
-        text = extract_text(str(save_path))
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="No readable text found in file.")
-
-        chunks = chunk_text(text, chunk_size=200, overlap=40)
-        stored_count = add_chunks_to_store(chunks, source_filename=filename)
-    except ValueError as e:
+        kind = validate_upload(display_name, data)
+    except UploadRejected as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # 2. Save under a random name only while extracting the text
+    save_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.{kind}"
+    try:
+        save_path.write_bytes(data)
+        try:
+            raw_text = extract_text(str(save_path))
+        except Exception as error:
+            raise HTTPException(
+                status_code=400, detail="This file couldn't be read. It may be damaged."
+            ) from error
+
+        text = check_extracted_text(raw_text)
+        chunks = chunk_text(text, chunk_size=200, overlap=40)
+        stored_count = add_chunks_to_store(chunks, source_filename=display_name)
+    except ValueError as e:  # includes UploadRejected
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Privacy: the original file isn't needed after extraction
+        save_path.unlink(missing_ok=True)
+
     return {
-        "filename": filename,
+        "filename": display_name,
         "chunks_stored": stored_count,
         "message": "Document processed and stored successfully.",
     }
@@ -174,7 +179,7 @@ def ask_question(request: QuestionRequest, http_request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # 2. Per-visitor limits: per minute and per day
+    # 2. Per-visitor daily limit
     visitor = get_client_id(http_request)
     enforce_limit(question_limiter.try_acquire(visitor), "questions", MAX_QUESTIONS_PER_DAY)
 
