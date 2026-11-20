@@ -280,7 +280,7 @@ def render_sidebar() -> bool:
         uploaded_file = st.file_uploader(
             "Upload PDF or DOCX", type=["pdf", "docx"], key="uploader", label_visibility="collapsed"
         )
-        st.markdown('<p class="dm-hint">Max 20 MB</p>', unsafe_allow_html=True)
+        st.markdown('<p class="dm-hint">PDF or DOCX · max 5 MB · 30 pages</p>', unsafe_allow_html=True)        
         if uploaded_file is not None:
             handle_upload(uploaded_file)
 

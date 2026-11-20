@@ -8,3 +8,7 @@ font = "sans serif"
 [client]
 # Hide the developer toolbar items for a cleaner demo
 toolbarMode = "minimal"
+
+[server]
+# Streamlit refuses files above this size (in MB) before they reach our code
+maxUploadSize = 5
