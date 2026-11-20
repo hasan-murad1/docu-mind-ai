@@ -1,14 +1,15 @@
-"""API tests for /ask and /upload: agent result, per-visitor limits and error mapping.
-
-The agent and the vector store are faked, so no model or network is used.
+"""API tests for /ask and /upload: agent result, per-visitor limits, upload security
+and error mapping. The agent and the vector store are faked, so no model or network is used.
 """
 
+import io
 from datetime import date
 from types import SimpleNamespace
 
 import pytest
 import requests
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 import main
 import usage_limiter
@@ -29,6 +30,18 @@ TRACE_STEP = {
     "retry": 0, "time_ms": 5.0, "llm_calls": 1,
 }
 GOOD_RESULT = {"answer": "ChromaDB.", "sources": ["a.pdf"], "trace": [TRACE_STEP]}
+
+
+def make_pdf(pages=1) -> bytes:
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=200, height=200)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+VALID_PDF = make_pdf()
 
 
 def http_error(status):
@@ -77,7 +90,7 @@ def api(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "run_agent", fake_run_agent)
     return SimpleNamespace(
         client=TestClient(main.app), calls=calls, behaviour=behaviour,
-        time=fake_time, questions=questions, uploads=uploads,
+        time=fake_time, questions=questions, uploads=uploads, upload_dir=tmp_path,
     )
 
 
@@ -85,7 +98,7 @@ def ask(client, question="What stores embeddings?"):
     return client.post("/ask", json={"question": question})
 
 
-def upload(client, name="notes.pdf", content=b"%PDF-1.4 test"):
+def upload(client, name="notes.pdf", content=VALID_PDF):
     return client.post("/upload", files={"file": (name, content)})
 
 
@@ -155,6 +168,24 @@ def test_upload_valid_file(api):
     response = upload(api.client)
     assert response.status_code == 200
     assert response.json()["chunks_stored"] == 1
+
+
+def test_upload_returns_a_clean_filename(api):
+    response = upload(api.client, name="../../secret report.pdf")
+    assert response.status_code == 200
+    assert response.json()["filename"] == "secret report.pdf"
+
+
+def test_uploaded_file_is_deleted_after_processing(api):
+    assert upload(api.client).status_code == 200
+    assert list(api.upload_dir.iterdir()) == []
+
+
+def test_fake_pdf_is_rejected_without_using_quota(api):
+    response = upload(api.client, name="invoice.pdf", content=b"MZ\x90\x00 a windows program")
+    assert response.status_code == 400
+    assert "real .pdf" in response.json()["detail"]
+    assert api.uploads.remaining_today(VISITOR) == MAX_UPLOADS_PER_DAY
 
 
 def test_upload_daily_limit_without_waiting(api):
