@@ -140,6 +140,37 @@ def list_sources(collection_name: str = "documents") -> list[str]:
     data = collection.get(limit=MAX_KEYWORD_SCAN_CHUNKS, include=["metadatas"])
     return sorted({m["source"] for m in data["metadatas"] if m and m.get("source")})
 
+def list_collection_names() -> list[str]:
+    """Names of every collection in the database."""
+    return [getattr(c, "name", c) for c in _chroma_client.list_collections()]
+
+
+def delete_collection(collection_name: str) -> None:
+    """Delete a collection. A collection that is already gone is ignored."""
+    try:
+        _chroma_client.delete_collection(name=collection_name)
+    except Exception:  # Chroma raises different errors for a missing collection
+        pass
+
+
+def copy_chunks(source_collection: str, target_collection: str) -> int:
+    """
+    Copy every chunk (text, metadata and embedding) from one collection to
+    another without re-embedding. Returns the number of chunks copied.
+    """
+    data = get_or_create_collection(source_collection).get(
+        limit=MAX_KEYWORD_SCAN_CHUNKS,
+        include=["documents", "metadatas", "embeddings"],
+    )
+    if not data["ids"]:
+        return 0
+    get_or_create_collection(target_collection).upsert(
+        ids=list(data["ids"]),
+        embeddings=[np.asarray(e, dtype=np.float32).tolist() for e in data["embeddings"]],
+        documents=list(data["documents"]),
+        metadatas=list(data["metadatas"]),
+    )
+    return len(data["ids"])
 
 # ---------- Read-only search tools ----------
 
