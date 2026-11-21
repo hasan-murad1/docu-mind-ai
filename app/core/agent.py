@@ -22,6 +22,7 @@ MAX_RETRIES = 3                  # query rewrites after the first retrieval
 MAX_LLM_CALLS_PER_QUESTION = 8   # worst case: 1 plan + 4 evaluate + 1 draft + 1 self-check = 7
 MAX_CONTEXT_CHUNKS = 8           # chunks kept across retries (best distance first)
 DEFAULT_TOP_K = 7
+DEFAULT_COLLECTION = "documents"  # used when no visitor collection is given
 
 # A file is shown as a source only if its closest chunk is this close to the best chunk
 SOURCE_DISTANCE_MARGIN = 0.5
@@ -159,19 +160,19 @@ def make_counted_llm(
 
 # ---------- Tools ----------
 
-def default_tools() -> dict:
-    """Real read-only search tools, all with the signature (query, top_k, source)."""
+def default_tools(collection_name: str = DEFAULT_COLLECTION) -> dict:
+    """Real read-only search tools on one collection, all with the signature (query, top_k, source)."""
     import vector_store  # lazy import: loads the embedding model
 
     return {
         "vector_search": lambda query, top_k, source=None: vector_store.search_similar_chunks(
-            query, top_k=top_k
+            query, top_k=top_k, collection_name=collection_name
         ),
         "keyword_search": lambda query, top_k, source=None: vector_store.keyword_search(
-            query, top_k=top_k
+            query, top_k=top_k, collection_name=collection_name
         ),
         "metadata_search": lambda query, top_k, source=None: vector_store.metadata_search(
-            query, source, top_k=top_k
+            query, source, top_k=top_k, collection_name=collection_name
         ),
     }
 
@@ -284,7 +285,8 @@ def run_agent(
     build_prompt_fn: Optional[Callable] = None,
     threshold: Optional[float] = None,
     top_k: int = DEFAULT_TOP_K,
-    daily_cap_fn: Optional[Callable[[], bool]] = None,
+        daily_cap_fn: Optional[Callable[[], bool]] = None,
+    collection_name: Optional[str] = None,
 ) -> dict:
     """
     Phase 6 agent: plan -> retrieve -> evaluate -> (rewrite + retry)
@@ -298,12 +300,13 @@ def run_agent(
     """
     question = validate_question(question)
 
+    collection = collection_name or DEFAULT_COLLECTION
     if tools is None:
-        tools = default_tools()
+        tools = default_tools(collection)
     if sources_fn is None:
         import vector_store  # lazy import
 
-        sources_fn = vector_store.list_sources
+        sources_fn = lambda: vector_store.list_sources(collection)
     if build_prompt_fn is None or threshold is None:
         import rag_pipeline  # lazy import
 
