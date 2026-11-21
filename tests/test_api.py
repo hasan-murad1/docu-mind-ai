@@ -1,5 +1,5 @@
-"""API tests for /ask and /upload: agent result, per-visitor limits, upload security
-and error mapping. The agent and the vector store are faked, so no model or network is used.
+"""API tests for /ask and /upload: agent result, per-visitor limits, sessions,
+upload security and error mapping. The agent, sessions and vector store are faked.
 """
 
 import io
@@ -24,6 +24,7 @@ from usage_limiter import (
 )
 
 VISITOR = "testclient"  # the client host that FastAPI's TestClient reports
+SESSION = "visitor_test_collection"
 
 TRACE_STEP = {
     "step": "plan", "tool": "llm", "chunks_retrieved": 0, "best_distance": None,
@@ -64,25 +65,45 @@ class FakeTime:
         return self.day
 
 
+class FakeSessions:
+    """Every visitor gets the same fake collection name."""
+
+    def __init__(self):
+        self.visitors = []
+
+    def collection_for(self, visitor_id):
+        self.visitors.append(visitor_id)
+        return SESSION
+
+
 @pytest.fixture
 def api(monkeypatch, tmp_path):
-    """Test client with a fake agent, fake storage and fresh per-visitor limiters."""
+    """Test client with a fake agent, fake storage, fake sessions and fresh limiters."""
     fake_time = FakeTime()
     questions = VisitorLimiter(MAX_QUESTIONS_PER_MINUTE, MAX_QUESTIONS_PER_DAY,
                                clock=fake_time.clock, today=fake_time.today)
     uploads = VisitorLimiter(MAX_UPLOADS_PER_MINUTE, MAX_UPLOADS_PER_DAY,
                              clock=fake_time.clock, today=fake_time.today)
+    sessions = FakeSessions()
+    stored_in = []
+
     monkeypatch.setattr(main, "question_limiter", questions)
     monkeypatch.setattr(main, "upload_limiter", uploads)
+    monkeypatch.setattr(main, "session_store", sessions)
     monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(main, "extract_text", lambda path: "some readable text " * 20)
-    monkeypatch.setattr(main, "add_chunks_to_store", lambda chunks, source_filename: len(chunks))
+    monkeypatch.setattr(
+        main, "add_chunks_to_store",
+        lambda chunks, source_filename, collection_name: stored_in.append(collection_name) or len(chunks),
+    )
 
     calls = []
+    agent_collections = []
     behaviour = {"result": GOOD_RESULT, "error": None}
 
-    def fake_run_agent(question):
+    def fake_run_agent(question, collection_name=None):
         calls.append(question)
+        agent_collections.append(collection_name)
         if behaviour["error"] is not None:
             raise behaviour["error"]
         return behaviour["result"]
@@ -91,6 +112,7 @@ def api(monkeypatch, tmp_path):
     return SimpleNamespace(
         client=TestClient(main.app), calls=calls, behaviour=behaviour,
         time=fake_time, questions=questions, uploads=uploads, upload_dir=tmp_path,
+        stored_in=stored_in, agent_collections=agent_collections,
     )
 
 
@@ -160,6 +182,13 @@ def test_response_drops_unexpected_trace_fields(api):
     response = ask(api.client)
     assert response.status_code == 200
     assert "SECRET_PROMPT" not in response.text
+
+
+def test_upload_and_ask_use_the_visitors_own_collection(api):
+    assert upload(api.client).status_code == 200
+    assert ask(api.client).status_code == 200
+    assert api.stored_in == [SESSION]
+    assert api.agent_collections == [SESSION]
 
 
 # ---------- /upload ----------
