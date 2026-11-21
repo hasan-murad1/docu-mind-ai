@@ -1,6 +1,6 @@
 """DocuMind AI - FastAPI backend.
 
-/upload : validate, extract, chunk, embed and store a document
+/upload : validate, extract, chunk, embed and store a document in the visitor's session
 /ask    : answer a question with the agentic RAG pipeline (returns a trace)
 """
 
@@ -19,6 +19,7 @@ sys.path.append(str(Path(__file__).parent / "core"))
 from agent import DailyCapExceeded, LLMBudgetExceeded, run_agent, validate_question
 from document_processor import extract_text, chunk_text
 from vector_store import add_chunks_to_store
+from sessions import SessionStore
 from upload_security import (
     MAX_UPLOAD_BYTES,
     UploadRejected,
@@ -39,6 +40,9 @@ app = FastAPI(title="DocuMind AI")
 # Uploaded files are written here only while their text is extracted
 UPLOAD_DIR = Path("data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Each visitor gets their own collection, deleted after 2 hours
+session_store = SessionStore()
 
 
 class QuestionRequest(BaseModel):
@@ -119,7 +123,7 @@ async def read_upload(file: UploadFile) -> bytes:
     return bytes(data)
 
 
-async def process_upload(file: UploadFile) -> dict:
+async def process_upload(file: UploadFile, collection_name: str) -> dict:
     """Check, extract, chunk and store one uploaded file. The file itself is not kept."""
     display_name = clean_filename(file.filename)
     data = await read_upload(file)
@@ -143,7 +147,9 @@ async def process_upload(file: UploadFile) -> dict:
 
         text = check_extracted_text(raw_text)
         chunks = chunk_text(text, chunk_size=200, overlap=40)
-        stored_count = add_chunks_to_store(chunks, source_filename=display_name)
+        stored_count = add_chunks_to_store(
+            chunks, source_filename=display_name, collection_name=collection_name
+        )
     except ValueError as e:  # includes UploadRejected
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -164,7 +170,8 @@ async def upload_document(http_request: Request, file: UploadFile = File(...)):
     enforce_limit(upload_limiter.try_acquire(visitor), "uploads", MAX_UPLOADS_PER_DAY)
 
     try:
-        return await process_upload(file)
+        collection = session_store.collection_for(visitor)
+        return await process_upload(file, collection)
     except HTTPException:
         # Rejected files (wrong type, too large, unreadable) don't use up the quota
         upload_limiter.refund(visitor)
@@ -183,10 +190,11 @@ def ask_question(request: QuestionRequest, http_request: Request):
     visitor = get_client_id(http_request)
     enforce_limit(question_limiter.try_acquire(visitor), "questions", MAX_QUESTIONS_PER_DAY)
 
-    # 3. Run the agent. The daily cap is charged inside the agent for EVERY
-    #    LLM call, so there is no upfront daily-cap check here (no double counting).
+    # 3. Run the agent on this visitor's own collection only. The daily cap is
+    #    charged inside the agent for EVERY LLM call (no double counting).
     try:
-        return run_agent(question)
+        collection = session_store.collection_for(visitor)
+        return run_agent(question, collection_name=collection)
     except Exception as error:
         # The visitor got no answer, so this question doesn't count
         question_limiter.refund(visitor)
