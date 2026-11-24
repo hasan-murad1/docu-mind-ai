@@ -1,119 +1,27 @@
-"""API tests for /ask and /upload: agent result, per-visitor limits, sessions,
-upload security and error mapping. The agent, sessions and vector store are faked.
-"""
+"""API tests: HTTP status codes, response shape and the upload size cap.
 
-import io
-from datetime import date
-from types import SimpleNamespace
+The flows themselves are tested in test_service.py; here the service runs on fakes.
+"""
 
 import pytest
 import requests
 from fastapi.testclient import TestClient
-from pypdf import PdfWriter
 
 import main
-import usage_limiter
 from agent import DailyCapExceeded, LLMBudgetExceeded
-from usage_limiter import (
-    MAX_QUESTION_LENGTH,
-    MAX_QUESTIONS_PER_DAY,
-    MAX_QUESTIONS_PER_MINUTE,
-    MAX_UPLOADS_PER_DAY,
-    MAX_UPLOADS_PER_MINUTE,
-    VisitorLimiter,
-)
+from fakes import GOOD_RESULT, TRACE_STEP, VALID_PDF, http_error, make_service
+from upload_security import MAX_UPLOAD_BYTES
+from usage_limiter import MAX_QUESTIONS_PER_DAY, MAX_UPLOADS_PER_DAY
 
 VISITOR = "testclient"  # the client host that FastAPI's TestClient reports
-SESSION = "visitor_test_collection"
-
-TRACE_STEP = {
-    "step": "plan", "tool": "llm", "chunks_retrieved": 0, "best_distance": None,
-    "retry": 0, "time_ms": 5.0, "llm_calls": 1,
-}
-GOOD_RESULT = {"answer": "ChromaDB.", "sources": ["a.pdf"], "trace": [TRACE_STEP]}
-
-
-def make_pdf(pages=1) -> bytes:
-    writer = PdfWriter()
-    for _ in range(pages):
-        writer.add_blank_page(width=200, height=200)
-    buffer = io.BytesIO()
-    writer.write(buffer)
-    return buffer.getvalue()
-
-
-VALID_PDF = make_pdf()
-
-
-def http_error(status):
-    response = requests.Response()
-    response.status_code = status
-    return requests.exceptions.HTTPError(response=response)
-
-
-class FakeTime:
-    """Controllable clock and calendar day for the limiters."""
-
-    def __init__(self):
-        self.now = 1000.0
-        self.day = date(2026, 11, 17)
-
-    def clock(self):
-        return self.now
-
-    def today(self):
-        return self.day
-
-
-class FakeSessions:
-    """Every visitor gets the same fake collection name."""
-
-    def __init__(self):
-        self.visitors = []
-
-    def collection_for(self, visitor_id):
-        self.visitors.append(visitor_id)
-        return SESSION
 
 
 @pytest.fixture
 def api(monkeypatch, tmp_path):
-    """Test client with a fake agent, fake storage, fake sessions and fresh limiters."""
-    fake_time = FakeTime()
-    questions = VisitorLimiter(MAX_QUESTIONS_PER_MINUTE, MAX_QUESTIONS_PER_DAY,
-                               clock=fake_time.clock, today=fake_time.today)
-    uploads = VisitorLimiter(MAX_UPLOADS_PER_MINUTE, MAX_UPLOADS_PER_DAY,
-                             clock=fake_time.clock, today=fake_time.today)
-    sessions = FakeSessions()
-    stored_in = []
-
-    monkeypatch.setattr(main, "question_limiter", questions)
-    monkeypatch.setattr(main, "upload_limiter", uploads)
-    monkeypatch.setattr(main, "session_store", sessions)
-    monkeypatch.setattr(main, "UPLOAD_DIR", tmp_path)
-    monkeypatch.setattr(main, "extract_text", lambda path: "some readable text " * 20)
-    monkeypatch.setattr(
-        main, "add_chunks_to_store",
-        lambda chunks, source_filename, collection_name: stored_in.append(collection_name) or len(chunks),
-    )
-
-    calls = []
-    agent_collections = []
-    behaviour = {"result": GOOD_RESULT, "error": None}
-
-    def fake_run_agent(question, collection_name=None):
-        calls.append(question)
-        agent_collections.append(collection_name)
-        if behaviour["error"] is not None:
-            raise behaviour["error"]
-        return behaviour["result"]
-
-    monkeypatch.setattr(main, "run_agent", fake_run_agent)
-    return SimpleNamespace(
-        client=TestClient(main.app), calls=calls, behaviour=behaviour,
-        time=fake_time, questions=questions, uploads=uploads, upload_dir=tmp_path,
-        stored_in=stored_in, agent_collections=agent_collections,
-    )
+    env = make_service(tmp_path)
+    monkeypatch.setattr(main, "app_service", env.service)
+    env.client = TestClient(main.app)
+    return env
 
 
 def ask(client, question="What stores embeddings?"):
@@ -124,26 +32,15 @@ def upload(client, name="notes.pdf", content=VALID_PDF):
     return client.post("/upload", files={"file": (name, content)})
 
 
-# ---------- /ask ----------
-
 def test_ask_returns_answer_sources_and_trace(api):
-    response = ask(api.client, "  What stores embeddings?  ")
+    response = ask(api.client)
     assert response.status_code == 200
     assert response.json() == GOOD_RESULT
-    assert api.calls == ["What stores embeddings?"]  # validated and stripped
+    assert api.sessions.visitors == [VISITOR]  # the visitor is the client host
 
 
-def test_ask_does_not_charge_daily_cap_upfront(api):
-    before = usage_limiter._daily_counter["count"]
-    ask(api.client)
-    assert usage_limiter._daily_counter["count"] == before
-
-
-@pytest.mark.parametrize("bad", ["", "   ", "x" * (MAX_QUESTION_LENGTH + 1)])
-def test_ask_rejects_bad_questions_without_using_quota(api, bad):
-    assert ask(api.client, bad).status_code == 400
-    assert api.calls == []
-    assert api.questions.remaining_today(VISITOR) == MAX_QUESTIONS_PER_DAY
+def test_bad_question_is_400(api):
+    assert ask(api.client, "   ").status_code == 400
 
 
 @pytest.mark.parametrize(
@@ -156,77 +53,46 @@ def test_ask_rejects_bad_questions_without_using_quota(api, bad):
         (requests.exceptions.ConnectionError(), 503),
     ],
 )
-def test_ask_maps_errors_and_gives_the_question_back(api, error, status):
-    api.behaviour["error"] = error
+def test_agent_errors_become_http_status_codes(api, error, status):
+    api.agent.error = error
     response = ask(api.client)
     assert response.status_code == status
     assert "detail" in response.json()
-    assert api.questions.remaining_today(VISITOR) == MAX_QUESTIONS_PER_DAY
 
 
-def test_ask_daily_limit_without_waiting(api):
-    # All daily questions can be asked back to back (no per-minute limit)
+def test_question_daily_limit_is_429(api):
     for _ in range(MAX_QUESTIONS_PER_DAY):
         assert ask(api.client).status_code == 200
-    blocked = ask(api.client)
-    assert blocked.status_code == 429
-    assert "today" in blocked.json()["detail"]
-    # Next day: both the date and the clock move forward, like in real life
-    api.time.day = date(2026, 11, 18)
-    api.time.now += 24 * 60 * 60
-    assert ask(api.client).status_code == 200
+    assert ask(api.client).status_code == 429
 
 
 def test_response_drops_unexpected_trace_fields(api):
-    api.behaviour["result"] = {**GOOD_RESULT, "trace": [{**TRACE_STEP, "prompt": "SECRET_PROMPT"}]}
+    api.agent.result = {**GOOD_RESULT, "trace": [{**TRACE_STEP, "prompt": "SECRET_PROMPT"}]}
     response = ask(api.client)
     assert response.status_code == 200
     assert "SECRET_PROMPT" not in response.text
 
 
-def test_upload_and_ask_use_the_visitors_own_collection(api):
-    assert upload(api.client).status_code == 200
-    assert ask(api.client).status_code == 200
-    assert api.stored_in == [SESSION]
-    assert api.agent_collections == [SESSION]
-
-
-# ---------- /upload ----------
-
 def test_upload_valid_file(api):
-    response = upload(api.client)
-    assert response.status_code == 200
-    assert response.json()["chunks_stored"] == 1
-
-
-def test_upload_returns_a_clean_filename(api):
     response = upload(api.client, name="../../secret report.pdf")
     assert response.status_code == 200
     assert response.json()["filename"] == "secret report.pdf"
 
 
-def test_uploaded_file_is_deleted_after_processing(api):
-    assert upload(api.client).status_code == 200
-    assert list(api.upload_dir.iterdir()) == []
-
-
-def test_fake_pdf_is_rejected_without_using_quota(api):
+def test_fake_pdf_is_400(api):
     response = upload(api.client, name="invoice.pdf", content=b"MZ\x90\x00 a windows program")
     assert response.status_code == 400
     assert "real .pdf" in response.json()["detail"]
+
+
+def test_too_large_upload_is_400_before_using_quota(api):
+    response = upload(api.client, content=b"%PDF-" + b"0" * MAX_UPLOAD_BYTES)
+    assert response.status_code == 400
+    assert "too large" in response.json()["detail"]
     assert api.uploads.remaining_today(VISITOR) == MAX_UPLOADS_PER_DAY
 
 
-def test_upload_daily_limit_without_waiting(api):
+def test_upload_daily_limit_is_429(api):
     for _ in range(MAX_UPLOADS_PER_DAY):
         assert upload(api.client).status_code == 200
-    blocked = upload(api.client)
-    assert blocked.status_code == 429
-    assert "today" in blocked.json()["detail"]
-
-
-def test_rejected_upload_does_not_use_quota(api):
-    for _ in range(5):
-        assert upload(api.client, name="notes.txt").status_code == 400
-    assert api.uploads.remaining_today(VISITOR) == MAX_UPLOADS_PER_DAY
-    assert upload(api.client).status_code == 200
+    assert upload(api.client).status_code == 429
