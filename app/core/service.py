@@ -20,6 +20,7 @@ import requests
 import vector_store
 from agent import DailyCapExceeded, LLMBudgetExceeded, run_agent, validate_question
 from document_processor import chunk_text, extract_text
+from rag_pipeline import ProviderNotConfigured
 from sessions import SessionStore
 from upload_security import UploadRejected, check_extracted_text, clean_filename, validate_upload
 from usage_limiter import LIMIT_DAY
@@ -47,6 +48,8 @@ class ServiceError(Exception):
 
 def agent_error_to_service_error(error: Exception) -> Optional[ServiceError]:
     """Map agent and provider errors to user-safe errors. Unknown errors return None."""
+    if isinstance(error, ProviderNotConfigured):
+        return ServiceError(503, "The AI provider isn't set up on this server yet.")
     if isinstance(error, DailyCapExceeded):
         return ServiceError(429, "Daily usage limit reached. Please try again tomorrow.")
     if isinstance(error, LLMBudgetExceeded):
