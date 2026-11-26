@@ -7,3 +7,6 @@ data/chroma_db/
 .DS_Store
 *.log
 data/uploads/
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
