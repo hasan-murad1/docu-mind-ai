@@ -13,8 +13,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # --- Provider selection ---
-LLM_PROVIDER = "groq"  # "groq" (cloud) or "ollama" (local)
-
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")  # "groq" (cloud) or "ollama" (local)
 # --- Ollama settings (local) ---
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "qwen3:4b"
@@ -22,7 +21,7 @@ OLLAMA_MODEL = "qwen3:4b"
 # --- Groq settings (cloud) ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "qwen/qwen3.8-27b"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 # Safety limit: don't wait forever for a response if a provider hangs
 REQUEST_TIMEOUT_SECONDS = 180
 
@@ -38,6 +37,10 @@ RELEVANCE_THRESHOLD = 2.0
 
 # The exact sentence used when the documents don't contain the answer
 NO_INFO_ANSWER = "I don't have information about that in the uploaded document(s)."
+
+
+class ProviderNotConfigured(RuntimeError):
+    """The selected LLM provider is missing its settings (e.g. no API key)."""
 
 
 def build_prompt(question: str, context_chunks: list[dict]) -> str:
@@ -118,6 +121,8 @@ def ask_llm(prompt: str) -> str:
 
 def ask_groq(prompt: str) -> str:
     """Send a prompt to the Groq API and return the generated answer."""
+    if not GROQ_API_KEY:
+        raise ProviderNotConfigured("GROQ_API_KEY is not set. Add it to .env or Streamlit secrets.")
     response = post_with_retry(
         GROQ_URL,
         {

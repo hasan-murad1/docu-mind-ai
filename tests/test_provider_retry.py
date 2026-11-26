@@ -22,6 +22,7 @@ def fake_response(status, body=None, retry_after=None):
 def fake_http(monkeypatch):
     """Replace requests.post and sleep. Returns (queue of responses, posts, sleeps)."""
     queue, posts, sleeps = [], [], []
+    monkeypatch.setattr(rag_pipeline, "GROQ_API_KEY", "test-key")
 
     def fake_post(url, headers=None, json=None, timeout=None):
         posts.append(url)

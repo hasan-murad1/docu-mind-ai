@@ -186,3 +186,31 @@ def test_list_sources_is_sorted_and_unique(collection_name):
     add_chunks_to_store(["x one", "x two"], "b.txt", collection_name=collection_name)
     add_chunks_to_store(["y one"], "a.txt", collection_name=collection_name)
     assert list_sources(collection_name) == ["a.txt", "b.txt"]
+
+
+
+
+# ---------- ONNX embeddings ----------
+
+def test_embed_texts_returns_normalized_384_dim_vectors():
+    import numpy as np
+
+    vectors = vector_store.embed_texts(["Who is the CEO?", "Refunds take 30 days."])
+    assert len(vectors) == 2
+    for vector in vectors:
+        assert len(vector) == vector_store.EMBEDDING_DIMENSIONS
+        assert np.linalg.norm(vector) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_embed_texts_keeps_similar_texts_closer():
+    import numpy as np
+
+    question, related, unrelated = vector_store.embed_texts([
+        "Who is the CEO of the company?",
+        "The chief executive officer of the company is Nadia Rahman.",
+        "Bananas are a good source of potassium.",
+    ])
+    near = np.sum((np.array(question) - np.array(related)) ** 2)
+    far = np.sum((np.array(question) - np.array(unrelated)) ** 2)
+    assert near < far
+    assert vector_store.embed_texts([]) == []

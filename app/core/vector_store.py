@@ -14,15 +14,16 @@ import re
 from pathlib import Path
 
 import chromadb
-from chromadb.config import Settings
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from chromadb.config import Settings
+from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
 # --- Safety limits ---
 MAX_CHUNKS_PER_BATCH = 5000        # max chunks stored in one call
 MAX_TOP_K = 20                     # max results any search can return
 MAX_QUERY_LENGTH = 500             # characters
 MAX_KEYWORD_SCAN_CHUNKS = 20000    # keyword search never scans more than this
+EMBEDDING_DIMENSIONS = 384         # all-MiniLM-L6-v2 output size
 
 # Common words ignored by keyword search (they match almost everything)
 STOPWORDS = {
@@ -33,15 +34,29 @@ STOPWORDS = {
     "can", "i", "me", "my", "you", "your", "there", "any", "tell",
 }
 
-# Load the embedding model once (slow, so we don't reload it per call)
-_embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Same model as before (all-MiniLM-L6-v2), run with ONNX Runtime instead of PyTorch.
+# Much smaller install and lower memory use, which matters on Streamlit Cloud.
+# The model (~80 MB) is downloaded once on first use and then cached.
+_embedding_fn = ONNXMiniLM_L6_V2()
 
-# Persistent ChromaDB client - data survives between runs
-# Telemetry off: avoids noisy warnings and sends no usage data anywhere
+# Persistent ChromaDB client - data survives between runs.
+# Telemetry off: avoids noisy warnings and sends no usage data anywhere.
 _chroma_client = chromadb.PersistentClient(
     path="data/chroma_db",
     settings=Settings(anonymized_telemetry=False),
 )
+
+
+# ---------- Embeddings ----------
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Embed texts with all-MiniLM-L6-v2 (ONNX). Returns one 384-dim vector per text."""
+    if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+        raise ValueError("texts must be a list of strings.")
+    if not texts:
+        return []
+    return [np.asarray(vector, dtype=np.float32).tolist() for vector in _embedding_fn(texts)]
+
 
 # ---------- Input validation ----------
 
@@ -104,7 +119,7 @@ def add_chunks_to_store(
     collection = get_or_create_collection(collection_name)
 
     # Embed first: if this fails, the old chunks are still untouched
-    embeddings = _embedding_model.encode(chunks).tolist()
+    embeddings = embed_texts(chunks)
     ids = [f"{source_filename}_chunk_{i}" for i in range(len(chunks))]
     metadatas = [{"source": source_filename, "chunk_index": i} for i in range(len(chunks))]
 
@@ -125,6 +140,37 @@ def list_sources(collection_name: str = "documents") -> list[str]:
     data = collection.get(limit=MAX_KEYWORD_SCAN_CHUNKS, include=["metadatas"])
     return sorted({m["source"] for m in data["metadatas"] if m and m.get("source")})
 
+def list_collection_names() -> list[str]:
+    """Names of every collection in the database."""
+    return [getattr(c, "name", c) for c in _chroma_client.list_collections()]
+
+
+def delete_collection(collection_name: str) -> None:
+    """Delete a collection. A collection that is already gone is ignored."""
+    try:
+        _chroma_client.delete_collection(name=collection_name)
+    except Exception:  # Chroma raises different errors for a missing collection
+        pass
+
+
+def copy_chunks(source_collection: str, target_collection: str) -> int:
+    """
+    Copy every chunk (text, metadata and embedding) from one collection to
+    another without re-embedding. Returns the number of chunks copied.
+    """
+    data = get_or_create_collection(source_collection).get(
+        limit=MAX_KEYWORD_SCAN_CHUNKS,
+        include=["documents", "metadatas", "embeddings"],
+    )
+    if not data["ids"]:
+        return 0
+    get_or_create_collection(target_collection).upsert(
+        ids=list(data["ids"]),
+        embeddings=[np.asarray(e, dtype=np.float32).tolist() for e in data["embeddings"]],
+        documents=list(data["documents"]),
+        metadatas=list(data["metadatas"]),
+    )
+    return len(data["ids"])
 
 # ---------- Read-only search tools ----------
 
@@ -159,9 +205,8 @@ def search_similar_chunks(
     if total == 0:
         return []
 
-    query_embedding = _embedding_model.encode([query]).tolist()
     results = collection.query(
-        query_embeddings=query_embedding,
+        query_embeddings=embed_texts([query]),
         n_results=min(top_k, total),
     )
     return _format_query_results(results)
@@ -189,9 +234,8 @@ def metadata_search(
     if matching == 0:
         return []
 
-    query_embedding = _embedding_model.encode([query]).tolist()
     results = collection.query(
-        query_embeddings=query_embedding,
+        query_embeddings=embed_texts([query]),
         n_results=min(top_k, matching),
         where=where,
     )
@@ -208,7 +252,7 @@ def _distances_for_ids(query: str, ids: list[str], collection) -> dict:
     Compute the same distance Chroma uses (squared L2) between the query
     and the given chunk IDs, so keyword results can use the same threshold.
     """
-    query_vec = np.asarray(_embedding_model.encode([query])[0], dtype=np.float64)
+    query_vec = np.asarray(embed_texts([query])[0], dtype=np.float64)
     stored = collection.get(ids=ids, include=["embeddings"])
     distances = {}
     for chunk_id, embedding in zip(stored["ids"], stored["embeddings"]):
