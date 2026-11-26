@@ -4,6 +4,11 @@ Both front doors use it: the FastAPI backend (app/main.py) and the Streamlit
 app in direct mode. So per-visitor limits, session isolation, upload security
 and error handling behave the same everywhere. Problems are raised as
 ServiceError with a status code and a message that is safe to show to users.
+
+Two ids per visitor:
+- visitor_id picks the visitor's own document collection (one per browser session)
+- quota_id counts their daily questions and uploads (e.g. their IP address);
+  it defaults to visitor_id
 """
 
 import uuid
@@ -21,7 +26,11 @@ from usage_limiter import LIMIT_DAY
 from usage_limiter import question_limiter as shared_question_limiter
 from usage_limiter import upload_limiter as shared_upload_limiter
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_UPLOAD_DIR = Path("data/uploads")
+DEMO_DOCS_DIR = PROJECT_ROOT / "demo_docs"   # shared demo documents committed to the repo
+MAX_DEMO_FILES = 10
+DEMO_EXTENSIONS = {".pdf", ".docx"}
 CHUNK_SIZE = 200
 CHUNK_OVERLAP = 40
 
@@ -90,17 +99,39 @@ class DocuMindService:
             429, f"Too many {what} in a short time. Please wait a minute and try again.", retry_after=60
         )
 
+    # ---------- Demo documents ----------
+
+    def load_demo_documents(self, demo_dir=None) -> int:
+        """
+        Load the shared demo documents into the demo collection, once.
+        Returns how many files were loaded (0 if they were already there).
+        """
+        demo_collection = self.sessions.demo_collection
+        if self.sources_fn(demo_collection):
+            return 0
+        folder = Path(demo_dir) if demo_dir is not None else DEMO_DOCS_DIR
+        if not folder.is_dir():
+            return 0
+
+        files = sorted(p for p in folder.iterdir() if p.suffix.lower() in DEMO_EXTENSIONS)
+        for path in files[:MAX_DEMO_FILES]:
+            text = check_extracted_text(self.extract_fn(str(path)))
+            chunks = chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+            self.store_fn(chunks, source_filename=path.name, collection_name=demo_collection)
+        return len(files[:MAX_DEMO_FILES])
+
     # ---------- Upload ----------
 
-    def upload(self, visitor_id: str, filename, data) -> dict:
+    def upload(self, visitor_id: str, filename, data, quota_id: Optional[str] = None) -> dict:
         """Check and store one document in this visitor's own collection."""
-        self._check_limit(self.upload_limiter.try_acquire(visitor_id), "uploads", self.upload_limiter)
+        quota = quota_id or visitor_id
+        self._check_limit(self.upload_limiter.try_acquire(quota), "uploads", self.upload_limiter)
         try:
             collection = self.sessions.collection_for(visitor_id)
             return self._store_document(collection, filename, data)
         except ServiceError:
             # Rejected files (wrong type, too large, unreadable) don't use up the quota
-            self.upload_limiter.refund(visitor_id)
+            self.upload_limiter.refund(quota)
             raise
 
     def _store_document(self, collection: str, filename, data) -> dict:
@@ -138,20 +169,21 @@ class DocuMindService:
 
     # ---------- Ask ----------
 
-    def ask(self, visitor_id: str, question) -> dict:
+    def ask(self, visitor_id: str, question, quota_id: Optional[str] = None) -> dict:
         """Answer a question from this visitor's own documents. Returns answer, sources and trace."""
         try:
             question = validate_question(question)
         except ValueError as error:
             raise ServiceError(400, str(error)) from error
 
-        self._check_limit(self.question_limiter.try_acquire(visitor_id), "questions", self.question_limiter)
+        quota = quota_id or visitor_id
+        self._check_limit(self.question_limiter.try_acquire(quota), "questions", self.question_limiter)
         try:
             collection = self.sessions.collection_for(visitor_id)
             return self.agent_fn(question, collection_name=collection)
         except Exception as error:
             # The visitor got no answer, so this question doesn't count
-            self.question_limiter.refund(visitor_id)
+            self.question_limiter.refund(quota)
             mapped = agent_error_to_service_error(error)
             if mapped is None:
                 raise
@@ -163,11 +195,12 @@ class DocuMindService:
         """Names of the documents this visitor can ask about."""
         return self.sources_fn(self.sessions.collection_for(visitor_id))
 
-    def usage(self, visitor_id: str) -> dict:
+    def usage(self, visitor_id: str, quota_id: Optional[str] = None) -> dict:
         """What this visitor has left today, and when their files will be deleted."""
+        quota = quota_id or visitor_id
         return {
-            "questions_left": self.question_limiter.remaining_today(visitor_id),
-            "uploads_left": self.upload_limiter.remaining_today(visitor_id),
+            "questions_left": self.question_limiter.remaining_today(quota),
+            "uploads_left": self.upload_limiter.remaining_today(quota),
             "expires_in": self.sessions.expires_in(visitor_id),
         }
 
