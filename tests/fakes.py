@@ -63,6 +63,7 @@ class FakeTime:
 
 class FakeSessions:
     """Every visitor gets the same fake collection name."""
+    demo_collection = "demo_test"
 
     def __init__(self):
         self.visitors = []
